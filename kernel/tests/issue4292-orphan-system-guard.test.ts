@@ -7,16 +7,16 @@ import type {
 } from "../src/wire/anthropic.js";
 import type { BiliMessage } from "../src/wire/bili-message.js";
 
-// #4292: a fold covers the assistant messages that legitimized a client
-// mid-conversation system message. Because prune inserts each summary at
-// the EARLIEST covered position (kernel/src/prune.ts insertAt), the orphaned
-// sidecar system is always IMMEDIATELY followed by the no-sidecar core
-// system anchor (rendered summary), which emits as user — producing
-// [.., system, user, ..] that Anthropic rejects ("role 'system' must precede
-// an 'assistant' message or end the array"), 400ing the session forever.
-// coreToAnthropic re-voices exactly that adjacency (the fold signature) to
-// user. Everything else emits verbatim: the kernel is transport, not a
-// validator, so positionally-illegal client layouts round-trip byte-exact.
+// #4292/#4457: a fold that covers the assistant messages legitimizing a
+// client mid-conversation system message leaves it in a wire position
+// Anthropic rejects ("role 'system' must precede an 'assistant' message or
+// end the array"), 400ing the session forever. Since #4457 the fold layer
+// folds sidecar systems like ordinary messages (protected.ts), and
+// coreToAnthropic ends with a POSITION-based backstop: any non-directive
+// system whose first non-system follower is neither an assistant nor the
+// array end is healed — re-voiced to user with tool_update blocks stripped
+// (WC-022), dropped when nothing remains. Legal layouts (assistant next,
+// array end, trailing runs, directive-only anywhere) round-trip verbatim.
 
 function sys(content: AnthropicSystemMessage["content"]): AnthropicSystemMessage {
   return { role: "system", content };
@@ -85,7 +85,7 @@ test("#4292 shape: sidecar system immediately before the anchor is re-voiced", (
   });
 });
 
-test("consecutive orphaned systems before the anchor re-voice as a whole run", () => {
+test("consecutive orphaned systems before the anchor heal as a whole run", () => {
   const S1 = sys([{ type: "text", text: "first" }]);
   const S2 = sys([
     { type: "text", text: "second" },
@@ -102,7 +102,9 @@ test("consecutive orphaned systems before the anchor re-voice as a whole run", (
   assert.equal(rebuilt[1]!.role, "user");
   assert.deepEqual(rebuilt[1]!.content, S1.content);
   assert.equal(rebuilt[2]!.role, "user");
-  assert.deepEqual(rebuilt[2]!.content, S2.content);
+  // #4457/WC-022: tool_update blocks never survive a demotion to user —
+  // the text block alone is re-voiced, byte-identical.
+  assert.deepEqual(rebuilt[2]!.content, [{ type: "text", text: "second" }]);
   assert.deepEqual(rebuilt[3], {
     role: "user",
     content: [
@@ -141,13 +143,22 @@ test("Pi shape: system run at array end (no anchor after) round-trips verbatim",
   assert.deepEqual(roundTrip({ messages }), messages);
 });
 
-test("sidecar system followed by a plain user message stays verbatim", () => {
+test("sidecar system followed by a plain user message is healed (#4457 shape)", () => {
+  // [user, system, user] is exactly the #4457 wire: Anthropic 400s it
+  // ("system must precede an assistant message or end the array") — the
+  // backstop re-voices it to user instead of forwarding a dead request.
   const messages = [
     { role: "user", content: [{ type: "text", text: "a" }] },
     sys([{ type: "text", text: "between user turns" }]),
     { role: "user", content: [{ type: "text", text: "b" }] },
   ] as AnthropicWireMessage[];
-  assert.deepEqual(roundTrip({ messages }), messages);
+  const rebuilt = coreToAnthropic(anthropicToCore({ messages } as never).msgs as never);
+  assert.deepEqual(orphans(rebuilt), []);
+  assert.deepEqual(rebuilt, [
+    { role: "user", content: [{ type: "text", text: "a" }] },
+    { role: "user", content: [{ type: "text", text: "between user turns" }] },
+    { role: "user", content: [{ type: "text", text: "b" }] },
+  ]);
 });
 
 test("sidecar system immediately followed by an assistant stays verbatim", () => {
@@ -180,17 +191,18 @@ test("directive-only system adjacent to the anchor stays system (legal anywhere)
   assert.equal(rebuilt[2]!.role, "user");
 });
 
-test("run separated from a later anchor by a user core stays verbatim", () => {
-  // The anchor adjacency must be immediate: a user core between the system
-  // and the anchor means the system was NOT orphaned by that fold.
+test("system separated from a later anchor by a user core is healed too", () => {
+  // #4457/S2: the orphaning fold's anchor lands BEFORE the surviving
+  // system — no anchor adjacency exists, only the position rule catches it.
   const rebuilt = coreToAnthropic([
     { id: "u0", role: "user", contentType: "text", text: "q1" },
     { id: "s1", role: "system", contentType: "text", text: "mid", rawAnthropicMessage: sys("mid") },
     { id: "u1", role: "user", contentType: "text", text: "gap" },
     anchor("a1", "[Compressed conversation section] x"),
   ] as never);
-  assert.equal(rebuilt[1]!.role, "system");
-  assert.deepEqual(rebuilt[1], sys("mid"));
+  assert.deepEqual(orphans(rebuilt), []);
+  assert.equal(rebuilt[1]!.role, "user");
+  assert.equal(rebuilt[1]!.content, "mid");
 });
 
 test("sidecar system before an assistant and a later anchor stays verbatim", () => {
@@ -241,4 +253,59 @@ test("edge arrays are unaffected: empty, user-only, assistant-only", () => {
     ] as never),
     [{ role: "assistant", content: [{ type: "text", text: "hey" }] }],
   );
+});
+
+// --- #4457 backstop edges ---------------------------------------------------
+
+test("#4457: tool-block-only orphaned system is dropped, not re-voiced empty", () => {
+  const S = sys([TOOL_ADDITION]);
+  const rebuilt = coreToAnthropic([
+    { id: "u0", role: "user", contentType: "text", text: "q1" },
+    { id: "s1", role: "system", contentType: "text", text: "[tool_addition]", rawAnthropicMessage: S },
+    { id: "u1", role: "user", contentType: "text", text: "after" },
+  ] as never);
+  assert.deepEqual(orphans(rebuilt), []);
+  // The demotion drops the entry entirely (nothing re-voicable remains);
+  // the neighbouring user turns stay separate entries — the backstop
+  // never merges.
+  assert.deepEqual(rebuilt, [
+    { role: "user", content: [{ type: "text", text: "q1" }] },
+    { role: "user", content: [{ type: "text", text: "after" }] },
+  ]);
+});
+
+test("#4457: string-content orphaned system re-voices with the string intact", () => {
+  const S = sys("policy delta");
+  const rebuilt = coreToAnthropic([
+    { id: "u0", role: "user", contentType: "text", text: "q1" },
+    { id: "s1", role: "system", contentType: "text", text: "policy delta", rawAnthropicMessage: S },
+    { id: "u1", role: "user", contentType: "text", text: "after" },
+  ] as never);
+  assert.deepEqual(rebuilt[1], { role: "user", content: "policy delta" });
+});
+
+test("#4457: consecutive system run is judged by its first non-system follower", () => {
+  // Pi's trailing tool-delta + effort-marker run at array end is LEGAL —
+  // byte-exact verbatim even though the first system's immediate next is
+  // another system, not an assistant.
+  const messages = [
+    { role: "user", content: [{ type: "text", text: "a" }] },
+    sys([{ type: "text", text: "tools" }, TOOL_ADDITION]),
+    sys([{ type: "text", text: "trailing effort" }]),
+  ] as AnthropicWireMessage[];
+  assert.deepEqual(roundTrip({ messages }), messages);
+  // The same run followed by a user turn is illegal as a whole — every
+  // member is healed (tool blocks stripped, text kept).
+  const illegal = [
+    { role: "user", content: [{ type: "text", text: "a" }] },
+    sys([{ type: "text", text: "tools" }, TOOL_ADDITION]),
+    sys([{ type: "text", text: "trailing effort" }]),
+    { role: "user", content: [{ type: "text", text: "b" }] },
+  ] as AnthropicWireMessage[];
+  const rebuilt = coreToAnthropic(anthropicToCore({ messages: illegal } as never).msgs as never);
+  assert.deepEqual(orphans(rebuilt), []);
+  assert.equal(rebuilt[1]!.role, "user");
+  assert.deepEqual(rebuilt[1]!.content, [{ type: "text", text: "tools" }]);
+  assert.equal(rebuilt[2]!.role, "user");
+  assert.deepEqual(rebuilt[2]!.content, [{ type: "text", text: "trailing effort" }]);
 });

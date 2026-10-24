@@ -105,7 +105,10 @@ test("one core per system wire message, role system, wireIndex kept", () => {
   assert.match(systems[1]!.text as string, /\[tool_addition\]$/);
 });
 
-test("system message between two user turns does not merge them", () => {
+test("system message between two user turns heals to user (#4457)", () => {
+  // [user, system, user] is positionally illegal on the anthropic wire —
+  // the backstop re-voices it (tool blocks stripped per WC-022) instead of
+  // forwarding a request Anthropic guarantees to 400.
   const body = {
     messages: [
       { role: "user", content: [{ type: "text", text: "a" }] },
@@ -114,7 +117,19 @@ test("system message between two user turns does not merge them", () => {
     ],
   };
   const rebuilt = coreToAnthropic(anthropicToCore(body as never).msgs as never);
-  assert.deepEqual(rebuilt, body.messages);
+  assert.deepEqual(rebuilt, [
+    { role: "user", content: [{ type: "text", text: "a" }] },
+    {
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: 'Updated system prompt section "tools":\n<tools>…</tools>',
+        },
+      ],
+    },
+    { role: "user", content: [{ type: "text", text: "b" }] },
+  ]);
 });
 
 test("string-content system message round-trips", () => {
@@ -230,12 +245,13 @@ test("host-stamped mark lands on the last block; client marks stay put", () => {
   assert.deepEqual(coreToAnthropic(flat.msgs, flat.cacheControls)[0], pre);
 });
 
-test("control-plane system cores are never folded; other cores still are", () => {
+test("control-plane system cores fold like ordinary cores (#4457)", () => {
   const msgs = anthropicToCore(piBody() as never).msgs;
   for (const m of msgs) {
-    const sidecar = (m as { rawAnthropicMessage?: unknown })
-      .rawAnthropicMessage;
-    assert.equal(hasUnrecoverableMediaPayload(m), sidecar !== undefined, m.id);
+    // The pre-#4457 never-fold carve orphaned these into illegal wire
+    // positions (#4292/#4400/#4457) and leaked unbounded growth — they fold
+    // now; folding is reversible and tools[] re-states current toolsets.
+    assert.equal(hasUnrecoverableMediaPayload(m), false, m.id);
   }
   assert.equal(hasMediaPayload(msgs[0]!), false);
 });

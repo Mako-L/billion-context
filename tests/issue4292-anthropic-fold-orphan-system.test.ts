@@ -9,15 +9,16 @@ import {
 } from "acp-kernel/wire";
 import type { BiliMessage } from "acp-kernel/wire";
 
-// #4292: v0.1.204 (#3991) made client mid-conversation Anthropic
-// `role:"system"` messages re-emit verbatim in place, but a compression fold
-// can cover the assistant messages that legitimized such a message. Because
-// prune inserts the summary at the EARLIEST covered position, the orphaned
-// system is always immediately followed by the anchor (a no-sidecar core
-// system emitting as user) — [.., system, user, ..] makes Anthropic 400 the
-// session permanently (`messages.N: role 'system' must precede an 'assistant'
-// message or end the array`). coreToAnthropic re-voices exactly that fold
-// signature to user; every other client layout stays byte-exact.
+// #4292 → #4457: a compression fold can cover the assistant messages that
+// legitimized a client mid-conversation system. coreToAnthropic ends with a
+// POSITION-based backstop: any non-directive system whose first non-system
+// follower is neither an assistant nor the array end is healed — re-voiced
+// to user with tool_addition/tool_removal blocks stripped (WC-022) and
+// dropped when nothing remains. The fold layer itself now folds these
+// sidecar systems (kernel protected.ts, #4457), so fresh folds stop
+// producing the shape at all; the backstop also heals sessions folded by
+// older builds and positionally-illegal client input. Legal layouts
+// (assistant next, array end, directive-only anywhere) stay byte-exact.
 
 /** Indices of system entries violating the Anthropic position rule. */
 function orphanSystems(messages: AnthropicWireMessage[]): number[] {
@@ -86,19 +87,24 @@ test("pre-fold wire round-trips byte-identical (no fold, no re-voicing)", () => 
   assert.deepEqual(orphanSystems(rebuilt), []);
 });
 
-test("without the anchor adjacent, the orphaned system would stay system (documents #4292)", () => {
-  // The fold covered a DIFFERENT region: the client system keeps its
-  // verbatim system emission even though the assistants around it are gone.
-  // That emission is what Anthropic rejects — the kernel only re-voices the
-  // anchor-adjacency signature, so this shape is the host's to avoid.
+test("without the anchor adjacent, the orphaned system heals anyway (#4457 backstop)", () => {
+  // The fold covered a DIFFERENT region — no anchor adjacency exists. The
+  // #4457 position-based backstop does not need the fold signature: any
+  // system whose follower is neither an assistant nor the array end is
+  // healed, so this previously-fatal shape survives too.
   const cores = postFoldCore().filter((m) => m.id !== "anchor");
   const rebuilt = coreToAnthropic(cores as never);
-  assert.equal(rebuilt[1]!.role, "system");
-  assert.deepEqual(rebuilt[1]!.content, CLIENT_SYSTEM.content);
-  assert.deepEqual(orphanSystems(rebuilt), [1]);
+  assert.deepEqual(orphanSystems(rebuilt), []);
+  assert.equal(rebuilt[1]!.role, "user");
+  assert.deepEqual(rebuilt[1]!.content, [
+    {
+      type: "text",
+      text: 'Updated system prompt section "tools":\n<tools>…</tools>',
+    },
+  ]);
 });
 
-test("post-fold: anchor adjacency re-voices the orphan, bytes preserved", () => {
+test("post-fold: the backstop re-voices the orphan, tool blocks stripped (#4457)", () => {
   const cores = postFoldCore();
   const rebuilt = coreToAnthropic(cores as never);
   assert.deepEqual(
@@ -106,9 +112,15 @@ test("post-fold: anchor adjacency re-voices the orphan, bytes preserved", () => 
     [],
     "no illegal-position system remains after the fold guard",
   );
-  // The orphaned system became a user message with byte-identical blocks.
+  // The orphaned system became a user message: text blocks byte-identical,
+  // tool_addition stripped (WC-022 forbids it outside role:system).
   assert.equal(rebuilt[1]!.role, "user");
-  assert.deepEqual(rebuilt[1]!.content, CLIENT_SYSTEM.content);
+  assert.deepEqual(rebuilt[1]!.content, [
+    {
+      type: "text",
+      text: 'Updated system prompt section "tools":\n<tools>…</tools>',
+    },
+  ]);
   // Anchor + tail keep their user mapping with verbatim text.
   assert.deepEqual(rebuilt[2], {
     role: "user",
@@ -121,6 +133,11 @@ test("post-fold: anchor adjacency re-voices the orphan, bytes preserved", () => 
   assert.equal(
     (cores[1]!.rawAnthropicMessage as AnthropicSystemMessage).role,
     "system",
+  );
+  assert.equal(
+    (cores[1]!.rawAnthropicMessage as AnthropicSystemMessage).content.length,
+    2,
+    "the stored sidecar keeps its tool block for decompress",
   );
 });
 

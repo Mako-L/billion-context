@@ -81,7 +81,7 @@ test("#4166 fixed: MID system structured parts survive verbatim", () => {
   assert.ok(rbJson.includes("tool_addition"));
 });
 
-test("#4166: structured mid system is unfoldable (protection), plain one folds", async () => {
+test("#4166/#4457: structured mid system folds (reversible sidecar), plain one folds", async () => {
   const { hasUnrecoverableMediaPayload } = await import("../src/protected.js");
   const structured = responsesToCore({
     model: "m",
@@ -96,7 +96,7 @@ test("#4166: structured mid system is unfoldable (protection), plain one folds",
   } as never);
   const structuredCore = structured.msgs.find((m) => m.role === "system");
   assert.ok(structuredCore);
-  assert.equal(hasUnrecoverableMediaPayload(structuredCore), true);
+  assert.equal(hasUnrecoverableMediaPayload(structuredCore), false);
   const plain = responsesToCore({
     model: "m",
     input: [

@@ -575,28 +575,21 @@ export function hasMediaPayload(msg: CoreMessage): boolean {
 export function hasUnrecoverableMediaPayload(msg: CoreMessage): boolean {
   const m = msg as CoreMessage & MediaSidecar;
 
-  // A verbatim anthropic system message carrying control-plane state (Pi's
-  // tool_addition deltas, message-level output_config): folding it would
-  // silently un-declare the tools it adds — never fold. Plain-text ones
-  // (Claude Code's environment note) fold like any text message.
-  if (m.rawAnthropicMessage != null)
-    return !isPlainTextSystemMessage(m.rawAnthropicMessage);
-
-  // #4166 (openai wire, mirror of #3992): a verbatim openai mid-history
-  // system message carrying structured parts (DSH tool_addition-style
-  // blocks) folds into a summary ONLY as flattened text — the block bytes
-  // are unrecoverable, so never fold. Plain-text ones fold like any text
-  // message. isPlainTextSystemMessage is wire-generic: role/content keys +
-  // string-or-all-text-parts content.
-  if (m.rawOpenaiMessage != null)
-    return !isPlainTextSystemMessage(m.rawOpenaiMessage);
-
-  // #4166 (responses wire): same rule for client mid-history
-  // system/developer items riding rawResponsesItem. Role-guarded: user
-  // cores also carry rawResponsesItem (their byte-fidelity sidecar) and
-  // must NOT become unfoldable by this branch.
-  if (m.role === "system" && m.rawResponsesItem != null)
-    return !isPlainTextResponsesSystemItem(m.rawResponsesItem);
+  // #4457: client mid-conversation systems (anthropic/openai/responses
+  // sidecars — Pi's tool_addition deltas, DSH tool-update blocks,
+  // message-level output_config) fold like ordinary messages. Folding is
+  // REVERSIBLE (decompress restores the block bytes verbatim) and the tools
+  // they declare are re-stated in every request's top-level tools[] — the
+  // historical delta only annotates when a tool became available, a
+  // timeline the covered-turn summary carries. The pre-#4457 never-fold
+  // carve kept these messages alive while folding their neighbours,
+  // orphaning them into wire positions Anthropic rejects
+  // (#4292/#4400/#4457) and leaking unbounded growth. The wire keeps a
+  // position-based backstop (wire/anthropic.ts healIllegalSystemPositions)
+  // for sessions folded by older builds and positionally-illegal client
+  // input. NOTE: user cores also carry rawResponsesItem as their
+  // byte-fidelity sidecar and must not become unfoldable — no sidecar
+  // branch here at all anymore.
 
   const roc = m.rawOpenaiContent;
   if (roc != null) {
@@ -708,34 +701,6 @@ export function isPlainTextSystemMessage(raw: unknown): boolean {
         Object.keys(o).every(
           (k) => k === "type" || k === "text" || k === "cache_control",
         )
-      );
-    })
-  );
-}
-
-/** #4166: plain-text responses system/developer item — content is a
- *  string or an all-text parts array (input_text/output_text), so its bytes
- *  live entirely in `text` and folding loses nothing structural. */
-function isPlainTextResponsesSystemItem(raw: unknown): boolean {
-  const m = asObj(raw);
-  if (
-    !m ||
-    Object.keys(m).some(
-      (k) => k !== "type" && k !== "role" && k !== "content",
-    )
-  )
-    return false;
-  if (typeof m.content === "string") return true;
-  return (
-    Array.isArray(m.content) &&
-    m.content.length > 0 &&
-    m.content.every((b) => {
-      const o = asObj(b);
-      return (
-        o != null &&
-        (o.type === "input_text" || o.type === "output_text") &&
-        typeof o.text === "string" &&
-        Object.keys(o).every((k) => k === "type" || k === "text")
       );
     })
   );

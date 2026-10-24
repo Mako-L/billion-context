@@ -363,21 +363,11 @@ function rebuildSystemMessage(
   };
 }
 
-// #4292: bili's prune inserts each fold summary at the earliest covered
-// position (kernel/src/prune.ts insertAt), so a client mid-conversation
-// system message (verbatim via rawAnthropicMessage) orphaned by that fold is
-// ALWAYS immediately followed by the no-sidecar core system anchor —
-// emitting [.., system, anchor-as-user, ..] makes Anthropic 400 the session
-// permanently ("role 'system' must precede an 'assistant' message or end
-// the array"). Re-voice exactly that adjacency to user; every other client
-// layout stays verbatim — the kernel is transport, not a validator, so even
-// positionally-illegal client shapes round-trip byte-exact. Fresh objects
-// are substituted, never mutations, so session sidecars stay intact.
-// A directive-only system (empty content + output_config) is accepted at ANY
-// position by Anthropic's mid-conversation-system rule, so it is never part of
-// the orphan signature. Re-voicing it would mint an empty-content user message
-// that 400s on its own — leave those in place (mirrors the reporter's
-// isAnthropicDirectiveOnlySystem; #4292 hardening).
+// #4292 hardening, kept for #4457's backstop: a directive-only system
+// (empty content + output_config) is accepted at ANY position by
+// Anthropic's mid-conversation-system rule, so it is never healed; demoting
+// it would mint an empty-content user message that 400s on its own
+// (mirrors the reporter's isAnthropicDirectiveOnlySystem).
 function isDirectiveOnlySystem(e: AnthropicWireMessage): boolean {
   return (
     e.role === "system" &&
@@ -387,12 +377,45 @@ function isDirectiveOnlySystem(e: AnthropicWireMessage): boolean {
   );
 }
 
-function revoiceFoldOrphanedSystems(out: AnthropicWireMessage[]): void {
-  for (let j = out.length - 1; j >= 0; j--) {
+// #4457: Anthropic accepts a mid-conversation system only immediately
+// before an assistant message or at the end of the array — any other
+// position 400s the whole request, permanently killing the session (a run
+// of consecutive systems is judged by the run's first non-system follower:
+// Pi's trailing tool-delta + effort-marker runs are legal at array end).
+// The fold layer no longer produces such orphans (sidecar systems fold like
+// ordinary messages, kernel/src/protected.ts); this position-based backstop
+// heals whatever still arrives illegal: sessions folded by older builds
+// and positionally-illegal client input. Demotion re-voices to user with
+// tool_addition/tool_removal blocks stripped first (WC-022 forbids them
+// outside system) and drops the entry when nothing remains; a
+// directive-only system (empty content + output_config) is accepted at ANY
+// position, so it is never healed. Fresh objects only — sidecars stay
+// intact for future verbatim emission once re-legitimized.
+function isToolUpdateBlock(b: { type?: unknown }): boolean {
+  return b.type === "tool_addition" || b.type === "tool_removal";
+}
+
+function healIllegalSystemPositions(out: AnthropicWireMessage[]): void {
+  for (let j = 0; j < out.length; j++) {
     const e = out[j];
-    if (!e || e.role !== "system") break;
-    if (isDirectiveOnlySystem(e)) continue;
-    out[j] = { ...e, role: "user" };
+    if (!e || e.role !== "system" || isDirectiveOnlySystem(e)) continue;
+    let k = j + 1;
+    while (k < out.length && out[k]!.role === "system") k++;
+    const next = out[k];
+    if (!next || next.role === "assistant") continue;
+    if (typeof e.content === "string") {
+      out[j] = { role: "user", content: e.content };
+      continue;
+    }
+    const kept = e.content.filter(
+      (b) => !isToolUpdateBlock(b as { type?: unknown }),
+    );
+    if (kept.length === 0) {
+      out.splice(j, 1);
+      j--;
+      continue;
+    }
+    out[j] = { role: "user", content: kept };
   }
 }
 
@@ -419,12 +442,9 @@ export function coreToAnthropic(
       out.push(rebuildSystemMessage(m, cacheControls?.get(m.id)));
       continue;
     }
-    // #4292: a no-sidecar core system is a kernel-rendered fold anchor; the
-    // sidecar systems directly before it (current === null ⇒ the previous
-    // core emitted one) are the fold-orphaned run — re-voice it to user.
-    if (m.role === "system" && current === null) {
-      revoiceFoldOrphanedSystems(out);
-    }
+    // #4292/#4457: fold-orphaned and client-illegal system positions are
+    // healed by the position-based backstop after assembly (see below) —
+    // no shape matching here.
     const target: "user" | "assistant" =
       m.role === "assistant" ? "assistant" : "user";
     if (!current || current.role !== target) {
@@ -472,6 +492,7 @@ export function coreToAnthropic(
     }
   }
   flush();
+  healIllegalSystemPositions(out);
   return out;
 }
 
