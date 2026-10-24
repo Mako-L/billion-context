@@ -245,13 +245,12 @@ test("host-stamped mark lands on the last block; client marks stay put", () => {
   assert.deepEqual(coreToAnthropic(flat.msgs, flat.cacheControls)[0], pre);
 });
 
-test("control-plane system cores fold like ordinary cores (#4457)", () => {
+test("control-plane system cores are never folded; other cores still are", () => {
   const msgs = anthropicToCore(piBody() as never).msgs;
   for (const m of msgs) {
-    // The pre-#4457 never-fold carve orphaned these into illegal wire
-    // positions (#4292/#4400/#4457) and leaked unbounded growth — they fold
-    // now; folding is reversible and tools[] re-states current toolsets.
-    assert.equal(hasUnrecoverableMediaPayload(m), false, m.id);
+    const sidecar = (m as { rawAnthropicMessage?: unknown })
+      .rawAnthropicMessage;
+    assert.equal(hasUnrecoverableMediaPayload(m), sidecar !== undefined, m.id);
   }
   assert.equal(hasMediaPayload(msgs[0]!), false);
 });

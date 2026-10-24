@@ -10,9 +10,10 @@ import type { BiliMessage } from "../src/wire/bili-message.js";
 // #4292/#4457: a fold that covers the assistant messages legitimizing a
 // client mid-conversation system message leaves it in a wire position
 // Anthropic rejects ("role 'system' must precede an 'assistant' message or
-// end the array"), 400ing the session forever. Since #4457 the fold layer
-// folds sidecar systems like ordinary messages (protected.ts), and
-// coreToAnthropic ends with a POSITION-based backstop: any non-directive
+// end the array"), 400ing the session forever. The fold layer keeps these
+// sidecar systems out of folds (their tool deltas are functional — see
+// protected.ts), so orphans still arise; coreToAnthropic therefore ends
+// with a POSITION-based backstop: any non-directive
 // system whose first non-system follower is neither an assistant nor the
 // array end is healed — re-voiced to user with tool_update blocks stripped
 // (WC-022), dropped when nothing remains. Legal layouts (assistant next,

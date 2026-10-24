@@ -14,10 +14,11 @@ import type { BiliMessage } from "acp-kernel/wire";
 // POSITION-based backstop: any non-directive system whose first non-system
 // follower is neither an assistant nor the array end is healed — re-voiced
 // to user with tool_addition/tool_removal blocks stripped (WC-022) and
-// dropped when nothing remains. The fold layer itself now folds these
-// sidecar systems (kernel protected.ts, #4457), so fresh folds stop
-// producing the shape at all; the backstop also heals sessions folded by
-// older builds and positionally-illegal client input. Legal layouts
+// dropped when nothing remains. The fold layer keeps these sidecar systems
+// out of folds (kernel protected.ts never-fold carve — their tool deltas
+// are functional), so folds still orphan them; the backstop also heals
+// sessions folded by older builds and positionally-illegal client input.
+// Legal layouts
 // (assistant next, array end, directive-only anywhere) stay byte-exact.
 
 /** Indices of system entries violating the Anthropic position rule. */

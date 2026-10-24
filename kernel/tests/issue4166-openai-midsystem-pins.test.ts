@@ -84,7 +84,7 @@ test("#4166 fixed: mid system structured blocks round-trip verbatim via sidecar"
   assert.ok(rebuilt.indexOf(rb[0]) > 0, "position preserved");
 });
 
-test("#4166/#4457: structured mid system folds (reversible sidecar), plain one folds", async () => {
+test("#4166: structured mid system is unfoldable (protection), plain one folds", async () => {
   const { hasUnrecoverableMediaPayload } = await import("../src/protected.js");
   const structured = openaiToCore({
     model: "m",
@@ -98,7 +98,7 @@ test("#4166/#4457: structured mid system folds (reversible sidecar), plain one f
   } as never);
   const structuredCore = structured.msgs.find((m) => m.role === "system");
   assert.ok(structuredCore);
-  assert.equal(hasUnrecoverableMediaPayload(structuredCore), false);
+  assert.equal(hasUnrecoverableMediaPayload(structuredCore), true);
   const plain = openaiToCore({
     model: "m",
     messages: [

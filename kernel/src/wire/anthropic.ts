@@ -382,11 +382,16 @@ function isDirectiveOnlySystem(e: AnthropicWireMessage): boolean {
 // position 400s the whole request, permanently killing the session (a run
 // of consecutive systems is judged by the run's first non-system follower:
 // Pi's trailing tool-delta + effort-marker runs are legal at array end).
-// The fold layer no longer produces such orphans (sidecar systems fold like
-// ordinary messages, kernel/src/protected.ts); this position-based backstop
-// heals whatever still arrives illegal: sessions folded by older builds
-// and positionally-illegal client input. Demotion re-voices to user with
-// tool_addition/tool_removal blocks stripped first (WC-022 forbids them
+// The fold layer keeps sidecar systems OUT of folds (kernel/src/protected.ts
+// never-fold carve): their tool deltas are FUNCTIONAL under Anthropic's
+// mid-conversation-tool-changes contract — tools[] stays static for cache
+// stability and the deltas control which tools are offered (defer_loading
+// surfacing, by-value definitions, removals, MCP toolsets) — so folding them
+// would silently alter the effective tool set. Orphans still arise when a
+// fold covers the assistant that legitimized one; this position-based
+// backstop heals whatever still arrives illegal: sessions folded by older
+// builds and positionally-illegal client input. Demotion re-voices to user
+// with tool_addition/tool_removal blocks stripped first (WC-022 forbids them
 // outside system) and drops the entry when nothing remains; a
 // directive-only system (empty content + output_config) is accepted at ANY
 // position, so it is never healed. Fresh objects only — sidecars stay
@@ -404,7 +409,14 @@ function healIllegalSystemPositions(out: AnthropicWireMessage[]): void {
     const next = out[k];
     if (!next || next.role === "assistant") continue;
     if (typeof e.content === "string") {
-      out[j] = { role: "user", content: e.content };
+      // An empty string demoted to user would mint an empty-content user
+      // message, which 400s on its own — drop instead.
+      if (e.content === "") {
+        out.splice(j, 1);
+        j--;
+      } else {
+        out[j] = { role: "user", content: e.content };
+      }
       continue;
     }
     const kept = e.content.filter(
