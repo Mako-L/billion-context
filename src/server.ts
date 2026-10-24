@@ -3885,11 +3885,19 @@ function formatBytes(n: number): string {
 // bytes are counted with Buffer.byteLength since undici sends UTF-8 bytes even
 // for string bodies (.length would count UTF-16 chars and undercount any
 // non-ASCII injection). Omitted on paths that fail fast without forwarding.
+// #4528: inbound histories past this size pay an O(messages) synchronous scan
+// pass per turn on the main thread, large enough to starve the event loop and
+// freeze every endpoint on the same listener — warn so a pathological session
+// shows up in the log instead of being found through a frozen UI.
+const SLOW_SESSION_MSG_WARN = 1000;
 export function logRequestCost(log: (level: string, msg: string) => void, sessionId: string, msgs: number | null, inboundBytes: number, t0: number, outbound?: string | Buffer): void {
     const ms = Math.max(0, Math.round(performance.now() - t0));
     const outboundField = outbound !== undefined ? `, outbound=${formatBytes(Buffer.byteLength(outbound))}` : "";
     const view = currentFetchTransport() ? ", view=ws-expanded" : "";
     log("info", `[${sessionId}] request: ${msgs ?? "?"} msgs, inbound=${formatBytes(inboundBytes)}${outboundField}, local=${ms}ms${view}`);
+    if (msgs !== null && msgs > SLOW_SESSION_MSG_WARN) {
+        log("warn", `[${sessionId}] slow-session: ${msgs} msgs / inbound=${formatBytes(inboundBytes)} took local=${ms}ms — per-turn O(messages) synchronous scans are starving the event loop (#4528); consider closing/restarting the session or enabling compression`);
+    }
 }
 
 /** Thrown by readBody when the request body exceeds the configured receive-body

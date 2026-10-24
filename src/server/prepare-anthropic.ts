@@ -36,6 +36,7 @@ import { countSystemAndToolsTokens, emergencyNudge, emergencyNudgeArmed, project
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectSystem, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
+import { yieldToEventLoop } from "../yield-loop.js";
 
 export async function prepareAnthropic(
     parsed: AnthropicRequestBody,
@@ -300,9 +301,16 @@ export async function prepareAnthropic(
         // inactive call+result pairs inside, which would strip the anchors
         // this pass needs (the leak applies to the bare name too).
         reasoningPlan = planReasoningDrop(renderMsgs, reasoning, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
+        // #4528: processTurn is the largest single synchronous pass over the
+        // resent history; yield before it so UI/API requests that queued during
+        // this turn are served, not frozen behind the whole turn.
+        await yieldToEventLoop();
         const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
+        // #4528: split the kernel pass from its post-processing scan passes so
+        // each is a bounded synchronous stretch rather than one long block.
+        await yieldToEventLoop();
         // The fold from last turn's compress has now materialized in state —
         // future usage reports are post-fold reality, drop the credit.
         session.stats.compressCreditTokens = 0;
