@@ -135,6 +135,60 @@ describe("#4484 merge preserves existing block coverage", () => {
     assert.equal(computeIntegrityWithdrawals(messages, after).withdrawn.size, 0);
   });
 
+  it("impossible merge: fails fast up-front without touching existing coverage", () => {
+    const core = createCore();
+    const messages: CoreMessage[] = [
+      { id: "old-user", role: "user", contentType: "text", text: LONG },
+      { id: "old-assistant", role: "assistant", contentType: "text", text: "Previous work finished." },
+      { id: "read-call", role: "assistant", contentType: "tool-call", toolName: "Read", toolCallId: "read-1", text: '{"path":"/tmp/example.txt"}' },
+      { id: "read-result", role: "tool", contentType: "tool-result", toolName: "Read", toolCallId: "read-1", text: LONG },
+      { id: "new-user", role: "user", contentType: "text", text: "Continue." },
+    ];
+    const state = createInitialState();
+    let nextRef = 1;
+    for (const m of messages) {
+      const ref = `m${String(nextRef++).padStart(5, "0")}`;
+      state.messageRefs.byRaw[m.id] = ref;
+      state.messageRefs.byRef[ref] = m.id;
+    }
+    const seeded = core.applyCompression({
+      messages,
+      state,
+      config,
+      ranges: [{ startRef: state.messageRefs.byRaw["old-user"]!, endRef: state.messageRefs.byRaw["old-assistant"]!, summary: SUMMARY }],
+    });
+    if (seeded.result.blocksCreated !== 1 || seeded.result.errors.length !== 0) {
+      throw new Error(`fixture seed failed: ${JSON.stringify(seeded.result)}`);
+    }
+    // b2 covers ONLY the call half of the Read pair — its tail cut mid-tool-group.
+    // No consistent non-regressive candidate exists: folding the call splits its
+    // pair, unfolding it strands a message whose only covering block is consumed.
+    seeded.state.blocks.push({
+      ...seeded.state.blocks[0]!,
+      blockId: "b2",
+      runId: "r2",
+      directMessageIds: ["read-call"],
+      effectiveMessageIds: ["read-call"],
+      compressedTokens: 100,
+      startRef: state.messageRefs.byRaw["read-call"]!,
+      endRef: state.messageRefs.byRaw["read-call"]!,
+    });
+    seeded.state.nextBlockId = 3;
+    seeded.state.nextRunId = 3;
+    seeded.state.stats.compressionCount = 2;
+    const before = coveredMessageIds(seeded.state);
+    const res = core.applyCompression({
+      messages,
+      state: seeded.state,
+      config,
+      ranges: [{ startRef: "b1", endRef: "b2", summary: SUMMARY }],
+    });
+    assert.equal(res.result.errors.length, 1, JSON.stringify(res.result));
+    assert.equal(res.result.blocksCreated, 0);
+    assert.match(res.result.errors[0]!, /cannot satisfy turn integrity/);
+    assert.deepEqual(lostCoverage(before, res.state), [], "state must stay untouched");
+  });
+
   it("control: a clean merge (no split, no protected tool) loses nothing", () => {
     const core = createCore();
     const messages: CoreMessage[] = [
