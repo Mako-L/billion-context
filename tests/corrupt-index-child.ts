@@ -121,6 +121,29 @@ export function stripOneTimeAlignment<T>(view: T): T {
     }
     const out = JSON.parse(json) as (T & { state?: Record<string, unknown>; blockContents?: unknown }) & Record<string, unknown>;
     if (out.state && "refLedgerAligned" in out.state) delete out.state["refLedgerAligned"];
+    // cacheLedger line `bd` digests hash the RAW outbound bodies — bodies whose
+    // only cross-leg delta is this same citation renumbering. The bodies are
+    // compared directly (per-turn shaCiteNorm), so masking the derived digests
+    // hides nothing; keeping them would fail every aligned comparison.
+    const ledger = (out.metadata as { cacheLedger?: { lines?: Array<Record<string, unknown>> } } | undefined)?.cacheLedger;
+    // Segment bookkeeping, not content, in the aligned view (#4599): a restart
+    // appends a fresh open tail line and re-anchors the closed-segment byte
+    // boundaries (be/bl/bs), so no-restart and restart legs legitimately differ
+    // there. Keep the closed segments' content; drop the unfinalized tail and
+    // the bookkeeping trio everywhere.
+    if (Array.isArray(ledger?.lines)) {
+      while (ledger.lines.length > 0 && ledger.lines[ledger.lines.length - 1]?.bl === undefined) ledger.lines.pop();
+      for (const line of ledger.lines) { delete line["bd"]; delete line["be"]; delete line["bl"]; delete line["bs"]; delete line["prov"]; delete line["seam"]; }
+    }
+    // agg is the same experience telemetry summed: a restart re-partitions the
+    // provider-cache misses into seam buckets (seamMissed/seamSuspects vs
+    // providerSideMissed), so legs legitimately disagree. Per-line content
+    // fields stay; only the derived aggregate goes.
+    if (ledger) delete (ledger as { agg?: unknown }).agg;
+    // snapshotShadow is the shadow-copier's OWN health telemetry — it reports
+    // the ingest pipeline's experience of building this view (errors, watermark
+    // drops), which is inherently load-path-dependent, not conversation state.
+    if (out.metadata && "snapshotShadow" in (out.metadata as Record<string, unknown>)) delete (out.metadata as Record<string, unknown>)["snapshotShadow"];
     if (bcEntries) out.blockContents = new Map(bcEntries.map(([k, val]) => [remap.get(k) ?? k, val]));
     return sortObjectKeys(out) as T;
 }
