@@ -1935,7 +1935,10 @@ export class UnifiedStore {
             return fail("sessions.kstate_json", "must not carry nextBlockId/nextRunId (columns own them)");
         }
 
-        const messages = this.getMessages(sessionId);
+        // #4666: retired rows carry the same projections (tombstone-only) —
+        // verifying them too closes the diagnostic gap where corruption on a
+        // retired row was invisible.
+        const messages = this.getMessages(sessionId, { includeRetired: true });
         const refByRaw = new Map(this.getRefs(sessionId).map((r) => [r.rawId, r.ref]));
         for (const m of messages) {
             checks++;

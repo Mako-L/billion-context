@@ -12,9 +12,12 @@
  * columns are projections. JSON columns stay LONGTEXT — MySQL's JSON type
  * normalizes key order and would break the byte-exact digest contract.
  *
- * The DDL is the v7 shape directly (fresh-only: a MySQL deployment starts
- * at schema version 7 with the full table set; the sqlite migration
- * ladder does not apply).
+ * The DDL is the v8 shape directly for fresh installs. A legacy v7 library
+ * upgrades in place at init(): probe information_schema + idempotent
+ * ALTERs, then ONE transactional data step — identity backfill plus
+ * duplicate-row cleanup (#4666, parity with the sqlite v8 migration step)
+ * — gated on the bili_meta schema_version stamp so a crash mid-migration
+ * re-runs instead of stranding legacy rows at identity='' forever.
  *
  * Concurrency: one mysql2 connection pool per backend instance; every
  * multi-statement operation rides a dedicated-connection transaction.
@@ -56,7 +59,7 @@ import type {
  *  Same discipline as the jimp lazy load (src/image-rescale.ts, #3516). */
 export type Mysql2Module = typeof import("mysql2/promise");
 
-const MYSQL_SCHEMA_VERSION = 7;
+const MYSQL_SCHEMA_VERSION = 8;
 
 /** Fresh-install DDL: the schema.ts v7 shape in MySQL dialect. LONGTEXT for
  *  every verbatim JSON/bytes column (byte-exact round-trip; the JSON type
@@ -251,42 +254,102 @@ export class MysqlBackend implements StorageBackend {
                 if (s.length === 0) continue;
                 await conn.query(s);
             }
+            const [metaRows] = (await conn.query(
+                "SELECT meta_value FROM bili_meta WHERE meta_key = 'schema_version'",
+            )) as unknown as Row[][];
+            const current = num((metaRows[0] as Row | undefined)?.meta_value);
+            if (current < MYSQL_SCHEMA_VERSION) {
+                // #4390 v8: position-independent identity + historian
+                // tombstones. CREATE TABLE IF NOT EXISTS does not upgrade an
+                // existing v7 table — probe information_schema and ALTER
+                // idempotently (MySQL has no ADD COLUMN IF NOT EXISTS). The
+                // data step below is gated on the STAMP, not column presence:
+                // a crash between these DDLs and the backfill must re-run on
+                // the next boot instead of leaving legacy rows at
+                // identity='' forever (#4666). Every step is idempotent, so a
+                // partial re-run converges.
+                const [cols] = (await conn.query(
+                    "SELECT COLUMN_NAME AS col FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'messages'",
+                )) as unknown as Row[][];
+                const have = new Set((cols as unknown as { col?: unknown }[]).map((r) => String(r.col ?? "")));
+                if (!have.has("identity")) {
+                    await conn.query("ALTER TABLE messages ADD COLUMN identity VARCHAR(64) NOT NULL DEFAULT ''");
+                    await conn.query("ALTER TABLE messages ADD INDEX idx_messages_identity (session_id, msg_id, identity)");
+                }
+                if (!have.has("retired_at")) {
+                    await conn.query("ALTER TABLE messages ADD COLUMN retired_at BIGINT NULL");
+                }
+                // MySQL DDL commits implicitly, so the DDLs above are already
+                // durable when this transaction starts — it covers exactly
+                // the data work, and either fully lands or fully retries.
+                await this.tx(async (c) => {
+                    // Backfill identities from the CAS bytes (old rows keep
+                    // the polluted formula's hashes until rewritten; heal
+                    // them now) and clean up the wireIndex-split generations
+                    // it minted: same (session_id, msg_id, identity) → keep
+                    // the FIRST arrival (lowest seq), drop the later
+                    // duplicates and hand their CAS refs back. Parity with
+                    // the sqlite v8 migration step (src/storage/schema.ts) —
+                    // MySQL used to skip this, so legacy dirty libraries
+                    // replayed every duplicate forever (#4666).
+                    const [rows] = (await c.query(
+                        "SELECT m.session_id AS sid, m.seq AS seq, m.msg_id AS msg_id, m.content_hash AS content_hash, c.bytes AS body " +
+                            "FROM messages m JOIN content c ON c.hash = m.content_hash ORDER BY m.session_id, m.seq",
+                    )) as unknown as Row[][];
+                    const keep = new Map<string, { sid: string; seq: number; contentHash: string; identity: string }>();
+                    const drop: { sid: string; seq: number; contentHash: string }[] = [];
+                    for (const r of rows as unknown as Row[]) {
+                        const body = typeof r.body === "string" ? r.body : Buffer.from(r.body as Uint8Array).toString("utf8");
+                        const identity = identityOfStoredContent(body);
+                        const key = `${str(r.sid)}\u0000${str(r.msg_id)}\u0000${identity}`;
+                        const seen = keep.get(key);
+                        if (seen === undefined) {
+                            keep.set(key, { sid: str(r.sid), seq: num(r.seq), contentHash: str(r.content_hash), identity });
+                        } else if (num(r.seq) < seen.seq) {
+                            // an earlier arrival discovered late — swap the keeper
+                            drop.push({ sid: seen.sid, seq: seen.seq, contentHash: seen.contentHash });
+                            keep.set(key, { sid: str(r.sid), seq: num(r.seq), contentHash: str(r.content_hash), identity });
+                        } else {
+                            drop.push({ sid: str(r.sid), seq: num(r.seq), contentHash: str(r.content_hash) });
+                        }
+                    }
+                    for (const k of keep.values()) {
+                        await c.query("UPDATE messages SET identity = ? WHERE session_id = ? AND seq = ?", [
+                            k.identity,
+                            k.sid,
+                            k.seq,
+                        ]);
+                    }
+                    // Duplicates: delete their media mappings + message rows
+                    // and decrement CAS refcounts (delete referencing rows
+                    // FIRST — the #4242 discipline; the refcount > 0 floor
+                    // mirrors releaseContent so an already-corrupt ledger
+                    // cannot go negative — gc collects the <= 0 rows).
+                    for (const d of drop) {
+                        const [media] = (await c.query(
+                            "SELECT media_hash FROM message_media WHERE session_id = ? AND seq = ?",
+                            [d.sid, d.seq],
+                        )) as unknown as Row[][];
+                        for (const mm of media as unknown as Row[]) {
+                            await c.query("UPDATE content SET refcount = refcount - 1 WHERE hash = ? AND refcount > 0", [
+                                str(mm.media_hash),
+                            ]);
+                        }
+                        await c.query("DELETE FROM message_media WHERE session_id = ? AND seq = ?", [d.sid, d.seq]);
+                        await c.query("DELETE FROM messages WHERE session_id = ? AND seq = ?", [d.sid, d.seq]);
+                        await c.query("UPDATE content SET refcount = refcount - 1 WHERE hash = ? AND refcount > 0", [
+                            d.contentHash,
+                        ]);
+                    }
+                });
+            }
+            // Stamp advances but never downgrades: a future library stamped
+            // higher than this build keeps its stamp.
             await conn.query(
                 "INSERT INTO bili_meta (meta_key, meta_value) VALUES ('schema_version', ?) " +
-                    "ON DUPLICATE KEY UPDATE meta_value = meta_value",
-                [String(MYSQL_SCHEMA_VERSION)],
+                    "ON DUPLICATE KEY UPDATE meta_value = GREATEST(CAST(meta_value AS UNSIGNED), CAST(? AS UNSIGNED))",
+                [String(MYSQL_SCHEMA_VERSION), String(MYSQL_SCHEMA_VERSION)],
             );
-            // #4390 v8: position-independent identity + historian tombstones.
-            // CREATE TABLE IF NOT EXISTS does not upgrade an existing v7
-            // table — probe information_schema and ALTER idempotently
-            // (MySQL has no ADD COLUMN IF NOT EXISTS).
-            const [cols] = (await conn.query(
-                "SELECT COLUMN_NAME AS col FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'messages'",
-            )) as unknown as Row[][];
-            const have = new Set((cols as unknown as { col?: unknown }[]).map((r) => String(r.col ?? "")));
-            if (!have.has("identity")) {
-                await conn.query("ALTER TABLE messages ADD COLUMN identity VARCHAR(64) NOT NULL DEFAULT ''");
-                await conn.query("ALTER TABLE messages ADD INDEX idx_messages_identity (session_id, msg_id, identity)");
-            }
-            if (!have.has("retired_at")) {
-                await conn.query("ALTER TABLE messages ADD COLUMN retired_at BIGINT NULL");
-            }
-            if (!have.has("identity") || !have.has("retired_at")) {
-                // Backfill identities from the CAS bytes (old rows keep the
-                // polluted formula's hashes until rewritten; heal them now).
-                const [rows] = (await conn.query(
-                    "SELECT m.session_id AS sid, m.seq AS seq, m.content_hash AS content_hash, c.bytes AS body " +
-                        "FROM messages m JOIN content c ON c.hash = m.content_hash WHERE m.identity = ''",
-                )) as unknown as Row[][];
-                for (const r of rows as unknown as Row[]) {
-                    const body = typeof r.body === "string" ? r.body : Buffer.from(r.body as Uint8Array).toString("utf8");
-                    await conn.query("UPDATE messages SET identity = ? WHERE session_id = ? AND seq = ?", [
-                        identityOfStoredContent(body),
-                        str(r.sid),
-                        num(r.seq),
-                    ]);
-                }
-            }
         } finally {
             conn.release();
         }
@@ -1629,7 +1692,10 @@ export class MysqlBackend implements StorageBackend {
         if (kstate.nextBlockId !== undefined || kstate.nextRunId !== undefined) {
             return fail("sessions.kstate_json", "must not carry nextBlockId/nextRunId (columns own them)");
         }
-        const messages = await this.getMessages(sessionId);
+        // #4666: retired rows carry the same projections (tombstone-only) —
+        // verifying them too closes the diagnostic gap where corruption on a
+        // retired row was invisible.
+        const messages = await this.getMessages(sessionId, { includeRetired: true });
         const refByRaw = new Map((await this.getRefs(sessionId)).map((r) => [r.rawId, r.ref]));
         for (const m of messages) {
             checks++;

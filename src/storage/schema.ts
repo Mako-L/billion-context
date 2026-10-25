@@ -367,45 +367,37 @@ export function migrateSchema(db: {
             const rows = db
                 .prepare("SELECT m.session_id AS session_id, m.seq AS seq, m.msg_id AS msg_id, m.content_hash AS content_hash, c.bytes AS content FROM messages m JOIN content c ON c.hash = m.content_hash")
                 .all() as { session_id: string; seq: number; msg_id: string; content: string; content_hash: string }[];
-            const keep = new Map<string, { session_id: string; seq: number; content_hash: string }>();
+            const keep = new Map<string, { session_id: string; seq: number; content_hash: string; identity: string }>();
             const drop: { session_id: string; seq: number; content_hash: string }[] = [];
-            const rawByIdentityKey = new Map<string, string>();
             for (const r of rows) {
                 // node:sqlite returns BLOB as Uint8Array — normalize to utf8
                 // before hashing (JSON.parse would coerce it to a comma list
                 // and silently hash the wrong input).
                 const raw = typeof r.content === "string" ? r.content : Buffer.from(r.content).toString("utf8");
                 const identity = identityOfStoredContent(raw);
-                rawByIdentityKey.set(`${r.session_id}\u0000${r.msg_id}\u0000${identity}`, raw);
                 const key = `${r.session_id}\u0000${r.msg_id}\u0000${identity}`;
                 const seen = keep.get(key);
                 if (seen === undefined) {
-                    keep.set(key, { session_id: r.session_id, seq: r.seq, content_hash: r.content_hash });
+                    keep.set(key, { session_id: r.session_id, seq: r.seq, content_hash: r.content_hash, identity });
                 } else if (r.seq < seen.seq) {
                     // an earlier arrival discovered late — swap the keeper
                     drop.push({ session_id: seen.session_id, seq: seen.seq, content_hash: seen.content_hash });
-                    keep.set(key, { session_id: r.session_id, seq: r.seq, content_hash: r.content_hash });
+                    keep.set(key, { session_id: r.session_id, seq: r.seq, content_hash: r.content_hash, identity });
                 } else {
                     drop.push({ session_id: r.session_id, seq: r.seq, content_hash: r.content_hash });
                 }
             }
-            const identityBySeq = new Map<string, string>();
-            for (const r of rows) {
-                const raw = rawByIdentityKey.get(`${r.session_id}\u0000${r.msg_id}\u0000${identityOfStoredContent(typeof r.content === "string" ? r.content : Buffer.from(r.content).toString("utf8"))}`) ?? (typeof r.content === "string" ? r.content : Buffer.from(r.content).toString("utf8"));
-                const identity = identityOfStoredContent(raw);
-                const key = `${r.session_id}\u0000${r.msg_id}\u0000${identity}`;
-                if (keep.get(key)?.seq === r.seq) identityBySeq.set(`${r.session_id}\u0000${r.seq}`, identity);
-            }
             const upd = db.prepare("UPDATE messages SET identity = ? WHERE session_id = ? AND seq = ?");
-            for (const [k, identity] of identityBySeq) {
-                const [sessionId, seqStr] = k.split("\u0000");
-                upd.run(identity, sessionId, Number(seqStr));
+            for (const k of keep.values()) {
+                upd.run(k.identity, k.session_id, k.seq);
             }
             // Duplicates: delete their media mappings + message rows and
             // decrement CAS refcounts (delete referencing rows FIRST — the
             // #4242 discipline; refcount may reach 0, the next gc run
-            // collects those content rows).
-            const decRef = db.prepare("UPDATE content SET refcount = refcount - 1 WHERE hash = ?");
+            // collects those content rows). The > 0 floor mirrors the
+            // releaseContent guards so an already-corrupt ledger cannot go
+            // negative during migration.
+            const decRef = db.prepare("UPDATE content SET refcount = refcount - 1 WHERE hash = ? AND refcount > 0");
             const delMedia = db.prepare("DELETE FROM message_media WHERE session_id = ? AND seq = ?");
             const mediaOf = db.prepare("SELECT media_hash FROM message_media WHERE session_id = ? AND seq = ?");
             const delMsg = db.prepare("DELETE FROM messages WHERE session_id = ? AND seq = ?");
