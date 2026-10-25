@@ -1116,6 +1116,13 @@ def ensure_origin(sidecar: Dict[str, str], deadline: Optional[float] = None) -> 
                     if marker is None or _marker_is_stale(marker) or not _marker_lane_matches(marker):
                         break
                     time.sleep(SPAWN_POLL_S)
+                # Final discovery pass closes the deadline-boundary sliver (#707, mirrors
+                # waitForStarterInstance in src/launcher.ts): the starter's own poll window ends
+                # ~now and its success path clears the marker — without one last look, an attach
+                # landing right at the boundary looks like a failure bail and double-spawns.
+                found = discover_instance(sidecar["script"], stop=_state.get("stop_event"))
+                if found:
+                    return _attach(found)
                 claimed = claim_starting_marker(token, port, AGENT_NAME)
             # A live DIFFERENT-lane holder can never produce an instance this lane may attach to
             # (#1225): spawn without coordinating, and leave its marker ALONE — removing it would
