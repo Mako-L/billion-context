@@ -156,17 +156,32 @@ function escapeRegExp(s: string): string {
  *  publish-boundary text, rewriting it to `~` (the shell universal for $HOME).
  *  This is the identity leak #3959 proved in the wild — a public diagnostics
  *  report naming /home/<user>/... hands a stranger the reporter's username and
- *  home layout. Only THIS machine's os.homedir() is rewritten, as an ANCHORED
- *  match on BOTH flanks: preceded by start-of-string or a non-token boundary
- *  (whitespace / quote / bracket / colon / equals) AND followed by a path
- *  separator (/ or \), a quote, whitespace or end-of-string — so sibling homes
- *  (/home/<other>), URL hosts and URL pathnames are all left alone. The result
- *  stays actionable: ~/.cache/billion-context/... is exactly where the user
- *  looks to recover. Idempotent (~ has no homedir in it). */
+ *  home layout. Every spelling of THIS machine's home root is rewritten —
+ *  os.homedir() plus the $HOME and %USERPROFILE% env values (on Windows they
+ *  diverge: os.homedir() reads USERPROFILE while git-bash-style tool output
+ *  carries $HOME paths, so masking only one leaks the other; POSIX values
+ *  dedupe to one root) — each as an ANCHORED match on BOTH flanks: preceded by
+ *  start-of-string or a non-token boundary (whitespace / quote / bracket /
+ *  colon / equals) AND followed by a path separator (/ or \), a quote,
+ *  whitespace or end-of-string — so sibling homes (/home/<other>), URL hosts
+ *  and URL pathnames are all left alone. The result stays actionable:
+ *  ~/.cache/billion-context/... is exactly where the user looks to recover.
+ *  Idempotent (~ has no homedir in it). */
+function publishHomeRoots(): string[] {
+    const roots = new Set<string>();
+    for (const raw of [os.homedir(), process.env.HOME, process.env.USERPROFILE]) {
+        if (typeof raw !== "string") continue;
+        const r = raw.replace(/[/\\]+$/, "");
+        if (r) roots.add(r);
+    }
+    return [...roots].sort((a, b) => b.length - a.length);
+}
+
 export function maskPathsForPublish(text: string): string {
-    const home = os.homedir();
-    if (!text || !home) return text;
-    const re = new RegExp("(?<![/\\w.\\-])" + escapeRegExp(home) + "(?=[/\\\\\"'\\s]|$)", "g");
+    if (!text) return text;
+    const roots = publishHomeRoots();
+    if (roots.length === 0) return text;
+    const re = new RegExp("(?<![/\\w.\\-])(" + roots.map(escapeRegExp).join("|") + ")(?=[/\\\\\"'\\s]|$)", "g");
     return text.replace(re, "~");
 }
 
