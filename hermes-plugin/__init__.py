@@ -68,6 +68,18 @@ ATTACH_WAIT_S = 30.0
 # slow-but-healthy start would still let turn 1 slip out uncompressed — the defect this gate exists
 # for. Derived, not hand-tuned: the two can never drift apart.
 FIRST_REQUEST_WAIT_S = BOOTSTRAP_BUDGET_S + 15.0
+# #4644: a failed bootstrap stage is retried with backoff instead of settling "failed" until the
+# host restarts — one transient hiccup (busy disk, momentarily unavailable port) must not cost the
+# whole host lifetime. Each attempt gets a FRESH BOOTSTRAP_BUDGET_S; the tuple is the sleep before
+# attempts 2..N, so total attempts = len(tuple) + 1.
+BOOTSTRAP_RETRY_BACKOFF_S = (10.0, 30.0, 60.0)
+# #4644: a ROUTED origin that dies takes the process env with it — the proxy vars were written once
+# at bootstrap and nothing would ever clear them, so every later model request hits a dead port
+# (connect-refused storms, silent direct connection). Poll the routed origin; N consecutive misses
+# (or our own child exiting) unroute it and re-bootstrap. Cadence mirrors the claude lane's proven
+# self-heal (30 s tick x 3 failures = recovery within ~90 s, README "Self-healing").
+ORIGIN_WATCH_INTERVAL_S = 30.0
+ORIGIN_WATCH_FAIL_LIMIT = 3
 # Core ACP tools whose absence from the OUTGOING request proves this session's tool snapshot was
 # built before the background registration landed — plugin-mode headers must not be stamped then.
 CORE_TOOL_NAMES = ("compress", "decompress", "acp_status")
@@ -111,6 +123,13 @@ _state: Dict[str, Any] = {
     "stop_event": threading.Event(),
     "warned_direct": False,
     "snapshot_warned": False,
+    # #4644 self-healing: watchdog_gen invalidates a previous generation's watchdog thread on
+    # load/unload; recovering marks an origin-death recovery in flight (single-flight guard);
+    # env_backup holds what apply_env overwrote so _unroute_env RESTORES it instead of deleting it.
+    "watchdog_gen": 0,
+    "watchdog_thread": None,
+    "recovering": False,
+    "env_backup": {},
 }
 
 # Serializes load/unload against bootstrap side effects (tool registration, env routing, child
@@ -139,6 +158,10 @@ def _reset_for_test() -> None:
         _state["stop_event"] = threading.Event()
         _state["warned_direct"] = False
         _state["snapshot_warned"] = False
+        _state["watchdog_gen"] = 0
+        _state["watchdog_thread"] = None
+        _state["recovering"] = False
+        _state["env_backup"] = {}
 
 
 # — paths ---------------------------------------------------------------------
@@ -557,29 +580,49 @@ def _read_marker() -> Optional[Dict[str, Any]]:
         return None
 
 
-def claim_starting_marker(token: str, port: int) -> bool:
+def claim_starting_marker(token: str, port: int, lane: Optional[str] = None) -> bool:
+    """Pure O_EXCL claim (#707). A live holder — of ANY lane — wins; the caller inspects the
+    marker and decides between waiting, removing a stale one, or spawning without coordinating
+    (#1225 lane semantics)."""
     path = _marker_path()
-    marker = {"token": token, "pid": os.getpid(), "host": "127.0.0.1", "port": port,
-              "startedAt": int(time.time() * 1000)}
-    while True:
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(json.dumps(marker))
-            return True
-        except FileExistsError:
-            cur = _read_marker()
-            if cur is not None and not _marker_is_stale(cur):
-                return False
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
-            except Exception:
-                return False
-        except Exception:
-            return False
+    marker: Dict[str, Any] = {"token": token, "pid": os.getpid(), "host": "127.0.0.1", "port": port,
+                              "startedAt": int(time.time() * 1000)}
+    if lane:
+        # #1225: declare our lane so OTHER lanes' launchers can tell our bring-up from theirs
+        # instead of stalling behind it for the whole TTL.
+        marker["lane"] = lane
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(marker))
+        return True
+    except FileExistsError:
+        return False
+    except Exception:
+        return False
+
+
+def remove_stale_marker() -> bool:
+    """Unlink ONLY when the holder is verified dead/TTL-expired or unreadable. While any marker
+    file exists, O_EXCL bars a newer claimant, so this can never clobber a live coordinator."""
+    cur = _read_marker()
+    if cur is not None and not _marker_is_stale(cur):
+        return False
+    try:
+        _marker_path().unlink()
+        return True
+    except FileNotFoundError:
+        return True
+    except Exception:
+        return False
+
+
+def _marker_lane_matches(marker: Dict[str, Any]) -> bool:
+    """#1225: an undeclared lane wildcards on both sides — only two DIFFERENT declared lanes are
+    mutually invisible to each other's starting markers."""
+    lane = marker.get("lane")
+    return not isinstance(lane, str) or lane == "" or lane == AGENT_NAME
 
 
 def clear_starting_marker(token: str) -> None:
@@ -1055,21 +1098,33 @@ def ensure_origin(sidecar: Dict[str, str], deadline: Optional[float] = None) -> 
     if port is None:
         return None
     token = uuid.uuid4().hex
-    claimed = claim_starting_marker(token, port)
+    claimed = claim_starting_marker(token, port, AGENT_NAME)
     if not claimed:
-        while time.monotonic() < deadline:
-            if _stopped():
-                return None
-            found = discover_instance(sidecar["script"], deadline=deadline, stop=_state.get("stop_event"))
-            if found:
-                return _attach(found)
-            marker = _read_marker()
-            if marker is None or _marker_is_stale(marker):
-                break
-            time.sleep(SPAWN_POLL_S)
-        if _stopped() or not claim_starting_marker(token, port):
-            return None
-        claimed = True
+        holder = _read_marker()
+        if holder is not None and not _marker_is_stale(holder):
+            if _marker_lane_matches(holder):
+                # A same-lane starter may produce an instance we can attach to: honor its
+                # bring-up instead of double-spawning over the same session store (#707).
+                while time.monotonic() < deadline:
+                    if _stopped():
+                        return None
+                    found = discover_instance(sidecar["script"], deadline=deadline,
+                                              stop=_state.get("stop_event"))
+                    if found:
+                        return _attach(found)
+                    marker = _read_marker()
+                    if marker is None or _marker_is_stale(marker) or not _marker_lane_matches(marker):
+                        break
+                    time.sleep(SPAWN_POLL_S)
+                claimed = claim_starting_marker(token, port, AGENT_NAME)
+            # A live DIFFERENT-lane holder can never produce an instance this lane may attach to
+            # (#1225): spawn without coordinating, and leave its marker ALONE — removing it would
+            # break THAT starter's coordination with its own same-lane launches.
+        elif remove_stale_marker():
+            # Stale or unreadable (crash mid-write): safe to remove — retry once to take the slot.
+            claimed = claim_starting_marker(token, port, AGENT_NAME)
+        # Still unclaimed (unwritable state dir, or lost the retry race): degrade to pre-#707
+        # behavior — spawn without coordinating; the token-guarded clear below becomes a no-op.
     try:
         child = _spawn_child(sidecar, port, token)
         if child is None:
@@ -1101,7 +1156,11 @@ def ensure_origin(sidecar: Dict[str, str], deadline: Optional[float] = None) -> 
 
 # — runtime effects -------------------------------------------------------------
 
-def apply_env(origin: str) -> bool:
+# The exact keys apply_env routes; _unroute_env restores them one-for-one on origin death (#4644).
+_ENV_ROUTED_KEYS = ("HTTPS_PROXY", "https_proxy", "HERMES_CA_BUNDLE", "SSL_CERT_FILE")
+
+
+def apply_env(origin: str, sidecar: Optional[Dict[str, str]] = None, ctx: Any = None) -> bool:
     """Route hermes's model traffic through the proxy. Only called once the proxy is healthy —
     the same pair `bili hermes` sets for the launched process. Returns False when the host unloaded
     the plugin first: routing a torn-down process's traffic would outlive the unload (checked and
@@ -1109,6 +1168,13 @@ def apply_env(origin: str) -> bool:
     with _lifecycle_lock:
         if _stopped():
             return False
+        if not _state.get("env_applied"):
+            # Remember what we are about to overwrite so _unroute_env can put it BACK when the
+            # origin dies mid-session — restoring (not deleting) keeps a user's pre-existing
+            # proxy configuration intact.
+            backup = _state.get("env_backup")
+            if not isinstance(backup, dict) or not backup:
+                _state["env_backup"] = {key: os.environ.get(key) for key in _ENV_ROUTED_KEYS}
         os.environ["HTTPS_PROXY"] = origin
         os.environ["https_proxy"] = origin
         ca_dir = data_dir() / "ca"
@@ -1123,7 +1189,110 @@ def apply_env(origin: str) -> bool:
             # keep blind-tunnelled hosts validating (#1375).
             os.environ["SSL_CERT_FILE"] = str(combined)
         _state["env_applied"] = True
-        return True
+    _ensure_watchdog(sidecar, ctx)
+    return True
+
+
+def _unroute_env() -> None:
+    """Undo apply_env after the routed origin died (#4644): restore whatever was there before we
+    routed (or drop the key entirely). Caller holds _lifecycle_lock."""
+    backup = _state.get("env_backup")
+    for key in _ENV_ROUTED_KEYS:
+        original = backup.get(key) if isinstance(backup, dict) else None
+        if original is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = original
+    _state["env_applied"] = False
+    _state["env_backup"] = {}
+
+
+def _ensure_watchdog(sidecar: Optional[Dict[str, str]], ctx: Any) -> None:
+    """Start the origin-health watchdog once per generation (#4644). A live thread means nothing
+    to do; register()/unload bump watchdog_gen so a previous generation's thread exits on its next
+    tick instead of double-driving recovery."""
+    if sidecar is None or ctx is None or _stopped():
+        return
+    thread = _state.get("watchdog_thread")
+    if thread is not None and thread.is_alive():
+        return
+    gen = int(_state.get("watchdog_gen") or 0)
+    watcher = threading.Thread(target=_watchdog_loop, args=(sidecar, ctx, gen),
+                               name="bili-origin-watchdog", daemon=True)
+    _state["watchdog_thread"] = watcher
+    watcher.start()
+
+
+def _watchdog_loop(sidecar: Dict[str, str], ctx: Any, gen: int) -> None:
+    """#4644: poll the ROUTED origin; N consecutive probe failures (or our own child exiting)
+    mean it is gone — unroute the process env and re-bootstrap inline, watching the new origin.
+    Without this, the env written once at bootstrap keeps pointing at a dead port for the whole
+    host lifetime (silent direct connection). The death verdict is re-validated against the
+    CURRENT origin under the lifecycle lock, so a concurrent re-route/unload wins over a stale
+    probe result."""
+    fails = 0
+    while True:
+        if _stopped() or int(_state.get("watchdog_gen") or 0) != gen:
+            return
+        event = _state.get("stop_event")
+        if event is not None and event.wait(ORIGIN_WATCH_INTERVAL_S):
+            return
+        if _stopped() or int(_state.get("watchdog_gen") or 0) != gen:
+            return
+        with _lifecycle_lock:
+            origin = _state.get("origin")
+            env_applied = bool(_state.get("env_applied"))
+            child = _state.get("child")
+        if not origin or not env_applied:
+            fails = 0
+            continue
+        reason: Optional[str] = None
+        if child is not None and child.poll() is not None:
+            reason = f"proxy child exited (code {child.returncode})"
+        elif probe_proxy(str(origin)):
+            fails = 0
+            continue
+        else:
+            fails += 1
+            if fails >= ORIGIN_WATCH_FAIL_LIMIT:
+                reason = f"unreachable {fails}\u00d7 in a row"
+        if reason is None:
+            continue
+        with _lifecycle_lock:
+            if _stopped() or int(_state.get("watchdog_gen") or 0) != gen:
+                return
+            if (_state.get("origin") != origin or not _state.get("env_applied")
+                    or _state.get("recovering")):
+                fails = 0
+                continue
+            had_tools = bool(_state.get("tools_ready"))
+            dead_child = _state.get("child")
+            _unroute_env()
+            # tool_names stays intact on purpose: the host session snapshot permanently carries
+            # the registered tools, and their handlers follow _state["origin"] dynamically — so
+            # the recovered origin serves this session in plugin mode from a fresh fold state.
+            _state.update(tools_ready=False, origin=None, mode=None, instance_id=None,
+                          child=None, warned_direct=False, recovering=True)
+            ready = _state.get("ready_event")
+            if ready is not None:
+                ready.clear()
+            rec = _bootstrap_record()
+            rec.update(state="starting", started_at=time.monotonic(), error=None, attempt=1)
+        if dead_child is not None:
+            try:
+                dead_child.terminate()
+            except Exception:
+                pass
+        logger.warning("billion-context: routed proxy %s is gone (%s) — unrouting and re-bootstrapping; "
+                       "model traffic goes direct until a new origin is healthy", origin, reason)
+        try:
+            _bootstrap(sidecar, ctx, skip_register=had_tools)
+        except Exception as exc:
+            logger.warning("billion-context: recovery bootstrap failed (%s)", exc)
+        finally:
+            with _lifecycle_lock:
+                _state["recovering"] = False
+        fails = 0
 
 
 def make_tool_handler(tool_name: str) -> Callable[..., str]:
@@ -1189,44 +1358,93 @@ def _register_tools(ctx: Any, tools: List[Any]) -> List[str]:
     return names
 
 
-def _bootstrap(sidecar: Dict[str, str], ctx: Any) -> None:
+def _sleep_backoff(attempt: int) -> bool:
+    """Sleep before bootstrap retry #(attempt+1); False when the plugin was unloaded meanwhile."""
+    delays = BOOTSTRAP_RETRY_BACKOFF_S
+    delay = delays[min(attempt, len(delays)) - 1]
+    event = _state.get("stop_event")
+    if event is not None:
+        return not event.wait(delay)
+    time.sleep(delay)
+    return not _stopped()
+
+
+def _bootstrap(sidecar: Dict[str, str], ctx: Any, skip_register: bool = False) -> None:
     """The slow half of register(): find/spawn a healthy proxy, route the process env through it,
     and install the native tools. It runs on a daemon thread so the host's load deadline only
     bounds the cheap registrations (REGISTER_WAIT_S). Every side effect re-checks the stop event:
-    an unload mid-bootstrap must leave neither a registration nor a child behind."""
+    an unload mid-bootstrap must leave neither a registration nor a child behind.
+
+    #4644: failed stages are retried with backoff (BOOTSTRAP_RETRY_BACKOFF_S), each attempt on a
+    FRESH BOOTSTRAP_BUDGET_S, and a stage that already succeeded is not re-run (a healthy origin
+    is not re-probed, a registered tool set is not re-fetched). skip_register marks the recovery
+    path: the host session snapshot already carries the tools from the previous generation and
+    their handlers follow _state["origin"] dynamically, so registration is re-armed, not repeated."""
     rec = _bootstrap_record()
-    deadline = time.monotonic() + BOOTSTRAP_BUDGET_S
+    max_attempts = len(BOOTSTRAP_RETRY_BACKOFF_S) + 1
+    origin: Optional[str] = None
+    env_ok = False
     try:
-        origin = ensure_origin(sidecar, deadline=deadline)
-        if _stopped():
-            _reap_unready_child()
-            return
-        if not origin:
-            rec.update(state="failed", error="could not reach or start a bili proxy")
-            logger.warning("billion-context: could not reach or start a bili proxy — model traffic "
-                           "goes direct (uncompressed) in this process")
-            return
-        if not apply_env(origin):
-            _reap_unready_child()
-            return
-        manifest = http_get_json(origin.rstrip("/") + "/__bili/plugin/manifest", MANIFEST_TIMEOUT_S)
-        tools = manifest.get("tools", {}).get("anthropic") if isinstance(manifest, dict) else None
-        if not isinstance(tools, list) or not tools:
-            rec.update(state="failed", error="proxy manifest had no tool definitions")
-            logger.warning("billion-context: proxy manifest had no tool definitions — compression "
-                           "stays server-side (proxy mode)")
-            return
-        names = _register_tools(ctx, tools)
-        if not _state.get("tools_ready"):
-            _reap_unready_child()
-            return
-        with _lifecycle_lock:
+        for attempt in range(1, max_attempts + 1):
+            rec.update(attempt=attempt)
             if _stopped():
                 _reap_unready_child()
                 return
-            rec.update(state="ready", error=None)
-        logger.info("billion-context: hermes native mode ready (%s, tools: %s)",
-                    _state.get("mode"), ", ".join(names))
+            if origin is None:
+                deadline = time.monotonic() + BOOTSTRAP_BUDGET_S
+                origin = ensure_origin(sidecar, deadline=deadline)
+                if _stopped():
+                    _reap_unready_child()
+                    return
+                if not origin:
+                    if attempt < max_attempts:
+                        if not _sleep_backoff(attempt):
+                            return  # unloaded during the backoff — _shutdown owns the record
+                        logger.warning("billion-context: could not reach or start a bili proxy "
+                                       "(attempt %d/%d) — retrying", attempt, max_attempts)
+                        continue
+                    rec.update(state="failed", error=f"could not reach or start a bili proxy "
+                               f"(after {attempt} attempt{'s' if attempt > 1 else ''})")
+                    logger.warning("billion-context: could not reach or start a bili proxy after "
+                                   "%d attempt%s — model traffic goes direct (uncompressed) in "
+                                   "this process", attempt, "s" if attempt > 1 else "")
+                    return
+            if not env_ok:
+                if not apply_env(origin, sidecar, ctx):
+                    _reap_unready_child()
+                    return
+                env_ok = True
+            if skip_register and _state.get("tool_names"):
+                names = list(_state["tool_names"])
+                with _lifecycle_lock:
+                    if _stopped():
+                        _reap_unready_child()
+                        return
+                    _state["tools_ready"] = True
+            else:
+                manifest = http_get_json(origin.rstrip("/") + "/__bili/plugin/manifest", MANIFEST_TIMEOUT_S)
+                tools = manifest.get("tools", {}).get("anthropic") if isinstance(manifest, dict) else None
+                if not isinstance(tools, list) or not tools:
+                    if attempt < max_attempts and _sleep_backoff(attempt):
+                        logger.warning("billion-context: proxy manifest had no tool definitions "
+                                       "(attempt %d/%d) — retrying", attempt, max_attempts)
+                        continue
+                    rec.update(state="failed", error="proxy manifest had no tool definitions")
+                    logger.warning("billion-context: proxy manifest had no tool definitions — "
+                                   "compression stays server-side (proxy mode)")
+                    return
+                names = _register_tools(ctx, tools)
+                if not _state.get("tools_ready"):
+                    _reap_unready_child()
+                    return
+            with _lifecycle_lock:
+                if _stopped():
+                    _reap_unready_child()
+                    return
+                rec.update(state="ready", error=None)
+            logger.info("billion-context: hermes native mode ready (%s, attempt %d, tools: %s)",
+                        _state.get("mode"), attempt, ", ".join(names))
+            return
     except Exception as exc:
         if not _stopped():
             rec.update(state="failed", error=f"{type(exc).__name__}: {exc}")
@@ -1268,12 +1486,18 @@ def _shutdown() -> None:
         _state["loaded"] = False
         _state["tools_ready"] = False
         _state["tool_names"] = ()
+        # Invalidate any watchdog of this generation: it must not drive recovery for an
+        # unloaded plugin (the stop event above wakes it from its tick wait anyway).
+        _state["watchdog_gen"] = int(_state.get("watchdog_gen") or 0) + 1
         rec = _state.get("bootstrap")
         if isinstance(rec, dict) and rec.get("state") != "ready":
             rec.update(state="stopped", error=None)
     thread = _state.get("thread")
     if thread is not None and thread.is_alive() and thread is not threading.current_thread():
         thread.join(timeout=1.0)
+    watcher = _state.get("watchdog_thread")
+    if watcher is not None and watcher.is_alive() and watcher is not threading.current_thread():
+        watcher.join(timeout=1.0)
     _reap_unready_child()
 
 
@@ -1473,9 +1697,11 @@ def acp_command(raw_args: str = "", *, session_id: str = "") -> Optional[str]:
             if boot_state == "starting":
                 started = boot.get("started_at")
                 elapsed = max(0.0, time.monotonic() - float(started)) if isinstance(started, (int, float)) else 0.0
-                return (f"bili: proxy is starting in the background{where} ({elapsed:.0f}s elapsed, "
-                        f"budget {BOOTSTRAP_BUDGET_S:.0f}s) — model traffic is held until it is "
-                        "ready; run /acp again in a moment.")
+                attempt = boot.get("attempt")
+                attempt_note = f", attempt {attempt}" if isinstance(attempt, int) and attempt > 1 else ""
+                return (f"bili: proxy is starting in the background{where}{attempt_note} "
+                        f"({elapsed:.0f}s elapsed, budget {BOOTSTRAP_BUDGET_S:.0f}s per attempt) — "
+                        "model traffic is held until it is ready; run /acp again in a moment.")
             detail = str(boot.get("error") or "unknown error")
             if origin and _state.get("env_applied"):
                 return (f"bili: proxy at {origin} is up but the native tool manifest is unavailable "
@@ -1588,6 +1814,9 @@ def register(ctx: Any) -> None:
                 # a stale stop event would kill the new bootstrap on its first check, so this
                 # generation gets fresh events and a clean record.
                 _state["stop_event"] = threading.Event()
+            # New generation: a previous generation's watchdog (if any) exits on its next tick
+            # instead of racing this bootstrap for recovery.
+            _state["watchdog_gen"] = int(_state.get("watchdog_gen") or 0) + 1
             _state["ready_event"] = threading.Event()
             _state["bootstrap"] = None
             _state["loaded"] = True

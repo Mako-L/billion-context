@@ -404,8 +404,10 @@ class FakeCtx:
         self.hooks = {}
         self.commands = {}
         self.unload = []
+        self.reg_counts = {}
 
     def register_tool(self, name=None, toolset=None, schema=None, handler=None, description="", **kw):
+        self.reg_counts[name] = self.reg_counts.get(name, 0) + 1
         self.tools[name] = {"toolset": toolset, "schema": schema, "handler": handler, "description": description}
 
     def register_middleware(self, kind, cb):
@@ -540,6 +542,7 @@ elif SCENARIO == "slow-boot-fail":
     os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
     mod.REGISTER_WAIT_S = 0.2
     mod.BOOTSTRAP_BUDGET_S = 0.4
+    mod.BOOTSTRAP_RETRY_BACKOFF_S = (0.1, 0.2, 0.3)
     mod.FIRST_REQUEST_WAIT_S = 2.0
     SLOW["enabled"] = True
     mod.register(ctx)
@@ -817,6 +820,162 @@ elif SCENARIO.startswith("mitm-"):
     out["mitm_kind"] = kind
     out["mitm_domains"] = mod.mitm_domains_from_config()
     out["mitm_warnings"] = list(WARNINGS)
+elif SCENARIO == "retry-recover":
+    # #4644: attempt 1 hits a still-booting proxy; the backoff retry lands when it comes up.
+    install_sidecar(False)
+    os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
+    mod.REGISTER_WAIT_S = 0.2
+    mod.BOOTSTRAP_BUDGET_S = 1.0
+    mod.BOOTSTRAP_RETRY_BACKOFF_S = (0.5, 1.0, 2.0)
+    mod.FIRST_REQUEST_WAIT_S = 3.0
+    SLOW["enabled"] = True
+    def release_later():
+        __import__("time").sleep(1.8)
+        SLOW["release"].set()
+    threading.Thread(target=release_later, daemon=True).start()
+    mod.register(ctx)
+    ready = mod._state.get("ready_event")
+    if ready is not None:
+        ready.wait(30)
+    rec = mod._state.get("bootstrap") or {}
+    out["retry_state"] = rec.get("state")
+    out["retry_attempt"] = rec.get("attempt")
+    out["retry_env"] = os.environ.get("HTTPS_PROXY")
+    out["retry_tools"] = sorted(ctx.tools.keys())
+    out["retry_warnings"] = [w for w in WARNINGS if "retrying" in w]
+elif SCENARIO == "retry-exhaust":
+    # #4644: a proxy that never comes up exhausts all attempts and settles failed (loudly).
+    install_sidecar(True)
+    os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
+    mod.REGISTER_WAIT_S = 0.2
+    mod.BOOTSTRAP_BUDGET_S = 0.3
+    mod.BOOTSTRAP_RETRY_BACKOFF_S = (0.1, 0.1, 0.1)
+    mod.FIRST_REQUEST_WAIT_S = 1.0
+    SLOW["enabled"] = True
+    mod.register(ctx)
+    thread = mod._state.get("thread")
+    if thread is not None:
+        thread.join(15)
+    rec = mod._state.get("bootstrap") or {}
+    out["exhaust_state"] = rec.get("state")
+    out["exhaust_error"] = rec.get("error")
+    out["exhaust_attempt"] = rec.get("attempt")
+    out["exhaust_env"] = os.environ.get("HTTPS_PROXY")
+    out["exhaust_acp"] = mod.acp_command("", session_id="sess-ex")
+    out["exhaust_warnings_retries"] = len([w for w in WARNINGS if "retrying" in w])
+elif SCENARIO == "origin-death":
+    # #4644: the routed origin dies after readiness; the watchdog unroutes (RESTORING the
+    # user's pre-existing proxy) and re-bootstraps without re-registering the tools.
+    install_sidecar(False)
+    os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
+    os.environ["HTTPS_PROXY"] = "http://user-proxy.example:9999"
+    mod.REGISTER_WAIT_S = 0.2
+    mod.BOOTSTRAP_BUDGET_S = 8.0
+    mod.FIRST_REQUEST_WAIT_S = 8.0
+    mod.ORIGIN_WATCH_INTERVAL_S = 0.2
+    mod.ORIGIN_WATCH_FAIL_LIMIT = 2
+    mod.register(ctx)
+    ready = mod._state.get("ready_event")
+    if ready is not None:
+        ready.wait(10)
+    out["death_initial_ready"] = (mod._state.get("bootstrap") or {}).get("state")
+    out["death_env_routed"] = os.environ.get("HTTPS_PROXY")
+    SLOW["enabled"] = True
+    def release_later():
+        __import__("time").sleep(1.5)
+        SLOW["release"].set()
+    threading.Thread(target=release_later, daemon=True).start()
+    gap_values = []
+    saw_gap = False
+    end = __import__("time").monotonic() + 20
+    while __import__("time").monotonic() < end:
+        v = os.environ.get("HTTPS_PROXY")
+        gap_values.append(v)
+        if v != ORIGIN:
+            saw_gap = True
+        rec = mod._state.get("bootstrap") or {}
+        if saw_gap and rec.get("state") == "ready" and v == ORIGIN:
+            break
+        __import__("time").sleep(0.05)
+    out["death_gap_values"] = list(dict.fromkeys(gap_values))
+    rec = mod._state.get("bootstrap") or {}
+    out["death_final_state"] = rec.get("state")
+    out["death_final_env"] = os.environ.get("HTTPS_PROXY")
+    out["death_tools"] = sorted(ctx.tools.keys())
+    out["death_register_calls"] = sum(ctx.reg_counts.values())
+    out["death_warnings"] = [w for w in WARNINGS if "is gone" in w]
+elif SCENARIO == "marker-foreign":
+    # #1225/#4644: our own claims declare the lane; a live FOREIGN-lane starter neither blocks us
+    # nor gets its marker removed (we spawn our own proxy beside it).
+    ok = mod.claim_starting_marker("lane-check", 1, "hermes")
+    m = mod._read_marker()
+    out["own_claim_lane"] = (m or {}).get("lane") if ok else None
+    mod.clear_starting_marker("lane-check")
+    # .cjs on purpose: BASE sits inside this ESM repo ("type": "module"), where a .js fixture
+    # using require() would die before writing anything.
+    proof_bytes = (b'require("fs").writeFileSync(require("path").join(process.env.XDG_STATE_HOME, '
+                   b'"billion-context", "spawn-proof.json"), JSON.stringify({started: true, '
+                   b'lane: process.env.BILI_LAUNCHER_LANE}));\n')
+    script = os.path.join(BASE, "proxy.cjs")
+    with open(script, "wb") as f:
+        f.write(proof_bytes)
+    with open(os.path.join(PLUGIN_DIR, "bili.json"), "w") as f:
+        json.dump({"proxyScript": script, "nodePath": os.environ["BC_NODE"]}, f)
+    sd = os.path.join(os.environ["XDG_STATE_HOME"], "billion-context")
+    os.makedirs(sd, exist_ok=True)
+    with open(os.path.join(sd, "proxy-starting"), "w") as f:
+        json.dump({"token": "foreign-token", "pid": os.getpid(), "host": "127.0.0.1", "port": 4321,
+                   "startedAt": int(__import__("time").time() * 1000), "lane": "dsh"}, f)
+    mod.BOOTSTRAP_BUDGET_S = 0.5
+    mod.BOOTSTRAP_RETRY_BACKOFF_S = (0.1, 0.1, 0.1)
+    mod.FIRST_REQUEST_WAIT_S = 1.0
+    mod.register(ctx)
+    thread = mod._state.get("thread")
+    if thread is not None:
+        thread.join(20)
+    out["state_after_foreign"] = (mod._state.get("bootstrap") or {}).get("state")
+    try:
+        with open(os.path.join(os.environ["XDG_STATE_HOME"], "billion-context", "spawn-proof.json")) as f:
+            out["spawn_proof"] = json.load(f)
+    except Exception:
+        out["spawn_proof"] = None
+    m = mod._read_marker()
+    out["foreign_marker_kept"] = bool(m and m.get("token") == "foreign-token" and m.get("lane") == "dsh")
+elif SCENARIO == "marker-same-lane":
+    # #1225/#4644: a SAME-lane starter is honored — we wait for its instance instead of
+    # double-spawning, and its marker stays untouched. The instance appears mid-wait
+    # (discovery runs once up front, so pre-writing it would bypass the marker path).
+    proof_bytes = (b'require("fs").writeFileSync(require("path").join(process.env.XDG_STATE_HOME, '
+                   b'"billion-context", "spawn-proof.json"), "1");\n')
+    script = os.path.join(BASE, "proxy.js")
+    with open(script, "wb") as f:
+        f.write(proof_bytes)
+    with open(os.path.join(PLUGIN_DIR, "bili.json"), "w") as f:
+        json.dump({"proxyScript": script, "nodePath": os.environ["BC_NODE"]}, f)
+    sd = os.path.join(os.environ["XDG_STATE_HOME"], "billion-context")
+    os.makedirs(sd, exist_ok=True)
+    with open(os.path.join(sd, "proxy-starting"), "w") as f:
+        json.dump({"token": "starter-token", "pid": os.getpid(), "host": "127.0.0.1", "port": 4321,
+                   "startedAt": int(__import__("time").time() * 1000), "lane": "hermes"}, f)
+    def publish_later():
+        __import__("time").sleep(0.6)
+        rec = {"origin": ORIGIN, "pid": os.getpid(), "instanceId": "drv-starter",
+               "codeFingerprint": hashlib.sha256(proof_bytes).hexdigest(), "host": "127.0.0.1",
+               "passthrough": False, "mitmDomains": [], "modelWindows": {}, "startedAt": 1,
+               "lane": "hermes", "launchToken": "tok"}
+        with open(os.path.join(sd, "proxy-origin"), "w") as f:
+            json.dump(rec, f)
+    threading.Thread(target=publish_later, daemon=True).start()
+    mod.BOOTSTRAP_BUDGET_S = 8.0
+    mod.register(ctx)
+    ready = mod._state.get("ready_event")
+    if ready is not None:
+        ready.wait(10)
+    out["mode_same_lane"] = mod._state.get("mode")
+    out["env_same_lane"] = os.environ.get("HTTPS_PROXY")
+    m = mod._read_marker()
+    out["starter_marker_kept"] = bool(m and m.get("token") == "starter-token")
+    out["same_lane_spawned"] = os.path.exists(os.path.join(sd, "spawn-proof.json"))
 else:
     raise SystemExit("unknown scenario: " + SCENARIO)
 
@@ -840,6 +999,7 @@ out.update({
     "commands": {k: v["description"] for k, v in ctx.commands.items()},
     "unload_callbacks": len(ctx.unload),
     "status_calls": RECORDED["status"],
+    "register_calls": sum(ctx.reg_counts.values()),
 })
 server.shutdown()
 print(json.dumps(out))
@@ -921,6 +1081,34 @@ interface DriverOut {
     env_after_unload?: string | null;
     mw_after_unload_none?: boolean;
     acp_after_unload?: string | null;
+    register_calls?: number;
+    retry_state?: string;
+    retry_attempt?: number;
+    retry_env?: string | null;
+    retry_tools?: string[];
+    retry_warnings?: string[];
+    exhaust_state?: string;
+    exhaust_error?: string | null;
+    exhaust_attempt?: number;
+    exhaust_env?: string | null;
+    exhaust_acp?: string | null;
+    exhaust_warnings_retries?: number;
+    death_initial_ready?: string;
+    death_env_routed?: string | null;
+    death_gap_values?: Array<string | null>;
+    death_final_state?: string;
+    death_final_env?: string | null;
+    death_tools?: string[];
+    death_register_calls?: number;
+    death_warnings?: string[];
+    own_claim_lane?: string | null;
+    spawn_proof?: { started?: boolean; lane?: string } | null;
+    foreign_marker_kept?: boolean;
+    state_after_foreign?: string;
+    mode_same_lane?: string;
+    env_same_lane?: string | null;
+    starter_marker_kept?: boolean;
+    same_lane_spawned?: boolean;
 }
 
 function runDriver(scenario: string, extraEnv: Record<string, string> = {}): { out: DriverOut | null; err: string } {
@@ -1313,6 +1501,69 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(out!.mw_after_fail_none, true);
         assert.ok(out!.mw_after_fail_elapsed! < 1, "a settled failure is not re-waited on every turn");
         assert.equal(out!.ready_event_set, true);
+    });
+
+    // #4644 self-healing: a failed bootstrap stage is retried with backoff instead of settling
+    // "failed" for the whole host lifetime, a routed origin that dies is unrouted and re-bootstrapped,
+    // and the starting marker carries the lane so cross-lane starters neither block nor are clobbered.
+    test("bootstrap retry: a failed start is retried with backoff and lands when the proxy comes up", () => {
+        if (!PY) return;
+        const { out, err } = runDriver("retry-recover");
+        assert.ok(out, err);
+        assert.equal(out!.retry_state, "ready");
+        assert.equal(out!.retry_attempt, 2, "the second attempt is the one that landed");
+        assert.equal(out!.retry_env, out!.origin, "traffic is routed after the successful retry");
+        assert.deepEqual(out!.retry_tools, ["acp_status", "compress", "decompress"]);
+        assert.equal(out!.retry_warnings!.length, 1, "each failed attempt logs one retry warning");
+    });
+
+    test("bootstrap retry: persistent failure exhausts the attempts and settles failed loudly", () => {
+        if (!PY) return;
+        const { out, err } = runDriver("retry-exhaust");
+        assert.ok(out, err);
+        assert.equal(out!.exhaust_state, "failed");
+        assert.equal(out!.exhaust_attempt, 4, "all four attempts ran before giving up");
+        assert.match(out!.exhaust_error!, /after 4 attempts/);
+        assert.equal(out!.exhaust_env, null, "env is not routed through an unreachable proxy");
+        assert.match(out!.exhaust_acp!, /failed to start/);
+        assert.match(out!.exhaust_acp!, /going direct/);
+        assert.equal(out!.exhaust_warnings_retries, 3, "three retries between the four attempts");
+    });
+
+    test("origin death: a dying routed proxy is unrouted (restoring prior env) and re-bootstrapped", () => {
+        if (!PY) return;
+        const { out, err } = runDriver("origin-death");
+        assert.ok(out, err);
+        assert.equal(out!.death_initial_ready, "ready");
+        assert.equal(out!.death_env_routed, out!.origin);
+        assert.ok(out!.death_gap_values!.includes("http://user-proxy.example:9999"),
+            "the unroute RESTORED the pre-existing user proxy instead of deleting the key");
+        assert.equal(out!.death_final_state, "ready", "the watchdog re-bootstrapped a healthy origin");
+        assert.equal(out!.death_final_env, out!.origin, "traffic is routed through the recovered origin again");
+        assert.deepEqual(out!.death_tools, ["acp_status", "compress", "decompress"]);
+        assert.equal(out!.death_register_calls, 3, "recovery re-arms readiness without re-registering tools");
+        assert.equal(out!.death_warnings!.length, 1, "one loud warning per death episode");
+    });
+
+    test("starting marker: our claim declares the lane; a live foreign-lane starter blocks nothing and is untouched", () => {
+        if (!PY) return;
+        const { out, err } = runDriver("marker-foreign");
+        assert.ok(out, err);
+        assert.equal(out!.own_claim_lane, "hermes", "our claims carry the lane for other lanes' launchers");
+        assert.ok(out!.spawn_proof?.started, "we spawned our own proxy instead of stalling behind the foreign marker");
+        assert.equal(out!.spawn_proof?.lane, "hermes");
+        assert.equal(out!.foreign_marker_kept, true, "the foreign starter's marker stays intact");
+        assert.equal(out!.state_after_foreign, "failed");
+    });
+
+    test("starting marker: a same-lane starter is honored — wait + attach, no double-spawn, marker untouched", () => {
+        if (!PY) return;
+        const { out, err } = runDriver("marker-same-lane");
+        assert.ok(out, err);
+        assert.equal(out!.mode_same_lane, "attach", "attached to the same-lane starter's instance");
+        assert.equal(out!.env_same_lane, out!.origin, "traffic is routed through it");
+        assert.equal(out!.same_lane_spawned, false, "no double-spawn over the starter's bring-up");
+        assert.equal(out!.starter_marker_kept, true);
     });
 
     test("unload mid-bootstrap: no late tool registration, the thread stops, and the middleware goes inert", () => {
