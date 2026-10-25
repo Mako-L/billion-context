@@ -43,7 +43,7 @@ import type { ProxyOptions } from "../src/config.ts";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { loadLegacyView, toLegacyLike } from "../src/storage/ingest.ts";
-import { canonicalize, sha256 } from "./golden-canonical.ts";
+import { canonicalize, sha256, sortObjectKeys } from "./golden-canonical.ts";
 
 // ---------------------------------------------------------------------------
 // Shared with the parent test files (moved verbatim, single definition).
@@ -79,6 +79,50 @@ export function viewStateDigest(view: ReturnType<typeof loadLegacyView>): string
         pluginSnapshot: view.pluginSnapshot,
         contentStore: view.contentStore,
     })));
+}
+
+/** #4316 layer 3 PR3/3 (380ef4dac): a unified full-mode cold load performs a
+ *  ONE-TIME ledger alignment — citation numbers are re-homed onto ledger
+ *  sequence (kernel restampRefsToLedger) and state.refLedgerAligned is stamped.
+ *  Cross-mode / cross-read-path "identical state" proofs must therefore compare
+ *  the state modulo that one-time renumbering: this strips the alignment stamp
+ *  and re-homes every ref number to a canonical order (k-th smallest raw id ->
+ *  m0000k), so two views differing ONLY in which numbering scheme produced
+ *  their refs hash identically under viewDigest/viewStateDigest. Object key
+ *  order is normalized too: different hydration paths build identical content
+ *  under different insertion orders, and canonicalize preserves them. Pure
+ *  function — returns a new object, input untouched. */
+export function stripOneTimeAlignment<T>(view: T): T {
+    const v = view as { state?: unknown; blockContents?: unknown };
+    if (!v.state || typeof v.state !== "object") return view;
+    const byRaw = (v.state as { messageRefs?: { byRaw?: Record<string, string> } }).messageRefs?.byRaw;
+    const remap = new Map<string, string>();
+    if (byRaw) {
+        for (const [raw, ref] of Object.entries(byRaw).sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+            remap.set(ref, `m${String(remap.size + 1).padStart(5, "0")}`);
+        }
+    }
+    // The JSON pass below flattens Maps — pull blockContents out while it is
+    // still a Map, renumber its keys afterwards, rebuild it. Everything else
+    // in these views is JSON-native.
+    const bcIsMap = v.blockContents instanceof Map;
+    let bcEntries: Array<[string, string]> | null = null;
+    let source: unknown = view;
+    if (bcIsMap) {
+        bcEntries = [...(v.blockContents as Map<string, string>).entries()];
+        source = { ...(v as Record<string, unknown>), blockContents: undefined };
+    }
+    let json = JSON.stringify(canonicalize(source));
+    if (remap.size > 0) {
+        // Single-pass alternation: sequential per-token replacement would chain
+        // (a target that is also another source gets re-mapped on the next pass).
+        const re = new RegExp(`\\b(${[...remap.keys()].join("|")})\\b`, "g");
+        json = json.replace(re, (tok) => remap.get(tok)!);
+    }
+    const out = JSON.parse(json) as (T & { state?: Record<string, unknown>; blockContents?: unknown }) & Record<string, unknown>;
+    if (out.state && "refLedgerAligned" in out.state) delete out.state["refLedgerAligned"];
+    if (bcEntries) out.blockContents = new Map(bcEntries.map(([k, val]) => [remap.get(k) ?? k, val]));
+    return sortObjectKeys(out) as T;
 }
 
 export interface StorageWire {
@@ -277,8 +321,12 @@ async function engproofScenario(argv: string[], run: CheckRun): Promise<void> {
         // Regression (#2781): the failed open must have CLOSED its handle.
         await runGuard(run, ENGPROOF_CHECK_NAMES.midFlowGuard, dir, "-moved");
 
+        // #4316 PR3/3: the clean full-mode read carried the one-time ledger
+        // alignment; the legacy fallback over the corrupt index did not. The
+        // parent passes its digest already modulo that alignment (single
+        // definition), so strip it here too before comparing.
         await run.run(ENGPROOF_CHECK_NAMES.stateDigest, () =>
-            assert.equal(viewStateDigest(toLegacyLike(reloaded)), expectedStateDigest,
+            assert.equal(viewStateDigest(stripOneTimeAlignment(toLegacyLike(reloaded))), expectedStateDigest,
                 "corrupt-index fallback state digest drift vs clean full-mode read"));
 
         // Writes must keep working (legacy path) — no throw, file refreshed.
