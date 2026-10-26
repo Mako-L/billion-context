@@ -1879,7 +1879,11 @@ test("#1117 apply() installs takeoverGate keyed on currentInitiator attribution"
             const gate = _stateTakeoverGateForTest();
             assert.ok(gate !== undefined, "takeoverGate installed");
             // unattributed (background chain, third-party in-process plugin) → NOT claimed
-            assert.equal(gate("https://api.anthropic.com/v1/messages"), false);
+            const rawNoneGate = gate("https://api.anthropic.com/v1/messages");
+            // #4829 review: the no-init (WS-lane-shaped) call must keep its SYNCHRONOUS
+            // verdict class — native-ws-intercept.ts compares with === false, no await.
+            assert.equal(rawNoneGate, false);
+            assert.equal(await rawNoneGate, false);
             // attributed (the host's own agent chain) → claimed
             ctx.setInitiator({ session: { id: "s1117" } });
             assert.equal(gate("https://api.anthropic.com/v1/messages"), true);
@@ -1914,8 +1918,9 @@ test("#1158 apply() gate refusal logs each endpoint once per process with attrib
             const refusedLines = (): string[] => (fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "").split("\n").filter((l) => l.length > 0 && l.includes("takeover gate refused"));
             try {
                 const url = "https://api.gate-probe.test/v1/chat/completions";
-                assert.equal(gate(url), false, "unattributed → refused");
-                assert.equal(gate(url), false, "second refusal of the same endpoint");
+                // #4829: the none arm settles async — the recall claim may decode bodies
+                assert.equal(await gate(url), false, "unattributed → refused");
+                assert.equal(await gate(url), false, "second refusal of the same endpoint");
                 let lines = refusedLines();
                 assert.equal(lines.length, 1, `expected one refusal line per endpoint, got: ${lines.join(" | ")}`);
                 // #3651 paste-safe sink: non-public hosts are masked in the line; the dedup key
@@ -1923,11 +1928,11 @@ test("#1158 apply() gate refusal logs each endpoint once per process with attrib
                 assert.match(lines[0]!, /https:\/\/<private-host>\/v1\/chat\/completions/);
                 assert.match(lines[0]!, /no active initiator attribution/);
                 // A query string neither spawns a new line nor leaks into it.
-                assert.equal(gate(`${url}?key=sk-do-not-log`), false);
+                assert.equal(await gate(`${url}?key=sk-do-not-log`), false);
                 assert.equal(refusedLines().length, 1);
                 assert.ok(!fs.readFileSync(logFile, "utf8").includes("do-not-log"), "query string must not reach the log");
                 // A different endpoint earns its own line.
-                assert.equal(gate("https://api.other-probe.test/v1/messages"), false);
+                assert.equal(await gate("https://api.other-probe.test/v1/messages"), false);
                 assert.equal(refusedLines().length, 2);
                 // Attributed traffic claims silently.
                 ctx.setInitiator({ session: { id: "s1158" } });
@@ -1969,11 +1974,12 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
             const refusedLines = (): string[] => (fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "").split("\n").filter((l) => l.length > 0 && l.includes("takeover gate refused"));
             try {
                 const url = "https://api.gate-l2.test/v1/chat/completions";
-                // four same-state (none) refusals → exactly one line; counting continues silently
-                assert.equal(gate(url), false);
-                assert.equal(gate(url), false);
-                assert.equal(gate(url), false);
-                assert.equal(gate(url), false);
+                // four same-state (none) refusals → exactly one line; counting continues
+                // silently (#4829: the none arm settles async — the recall claim may decode bodies)
+                assert.equal(await gate(url), false);
+                assert.equal(await gate(url), false);
+                assert.equal(await gate(url), false);
+                assert.equal(await gate(url), false);
                 let lines = refusedLines();
                 assert.equal(lines.length, 1, `expected one line for repeated same-state refusals, got: ${lines.join(" | ")}`);
                 assert.match(lines[0]!, /no active initiator attribution/);
@@ -1997,7 +2003,7 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
                 assert.equal(refusedLines().length, 2);
                 // back to plain none → transition the other way, count keeps running
                 ctx.agents.currentInitiator = () => undefined;
-                assert.equal(gate(url), false);
+                assert.equal(await gate(url), false);
                 lines = refusedLines();
                 assert.equal(lines.length, 3);
                 assert.match(lines[2]!, /refusals so far: 7 \(state threw→none\)$/);
@@ -2596,7 +2602,7 @@ test("#1158 apply() persists bootstrap failures to bili.log (GUI stderr is invis
             // proxy's own line shape, origin-marked — stderr alone is invisible
             // to GUI hosts, which is exactly how #1158 stayed silent.
             const content = fs.readFileSync(logFile, "utf8");
-            assert.match(content, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z \[warn\] \[v=[^\]]+\] \[dsh-client\] attach target http:\/\/127\.0\.0\.1:1 is not healthy — falling back to a spawned proxy$/m);
+            assert.match(content, /^\d{4}-\d{2}-\d{2}T[\d:.]+ \[warn\] \[v=[^\]]+\] \[dsh-client\] attach target http:\/\/127\.0\.0\.1:1 is not healthy — falling back to a spawned proxy$/m);
             assert.equal(errs.filter((e) => e.includes("not healthy")).length, 0, "#2831: must not reach the terminal surface");
         });
     } finally {
@@ -2618,7 +2624,7 @@ test("#1158 persistClientEvent: standard line shape into bili.log; broken fs nev
             persistClientEvent("probe https://relay.internal.example/v1/chat/completions?k=secret http://127.0.0.1:18788/bili/x https://api.deepseek.com/v1/messages");
             const logFile = path.join(stateHome, "billion-context", "bili.log");
             const content = fs.readFileSync(logFile, "utf8");
-            assert.match(content, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z \[warn\] \[v=[^\]]+\] \[dsh-client\] boom-marker-xyz$/m);
+            assert.match(content, /^\d{4}-\d{2}-\d{2}T[\d:.]+ \[warn\] \[v=[^\]]+\] \[dsh-client\] boom-marker-xyz$/m);
             assert.match(content, /probe https:\/\/<private-host>\/v1\/chat\/completions http:\/\/127\.0\.0\.1:18788\/bili\/x https:\/\/api\.deepseek\.com\/v1\/messages$/m);
         });
         // Broken target (state root under a regular file): must swallow, never throw.

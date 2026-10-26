@@ -537,6 +537,19 @@ export function lastForwardedBody(session: Session): SeamSlot | undefined {
     return pendingCapture(session).sentBody;
 }
 
+/** #4731: the pending evidence PAIR of the in-flight request — outbound body
+ *  AND inbound view from ONE source: the ALS capture when this code runs
+ *  inside withCacheCapture (relay lane), else session.transient (loop lane).
+ *  Callers that pair the two sides MUST take both from here; mixing one side
+ *  from the capture with the other from the fallback can mate an old body
+ *  with fresh usage and mis-attribute the seam. Settled baselines
+ *  (settledBody/settledInBody) always live on session.transient and stay
+ *  read from there on every lane. */
+export function pendingEvidencePair(session: Session): { sentBody?: SeamSlot; inBody?: InboundSlot } {
+    const pending = pendingCapture(session);
+    return { sentBody: pending.sentBody, inBody: pending.inBody };
+}
+
 /** #3023: capture side of the inbound pair — call at the send chokepoint
  *  (src/server/relay.ts), next to noteForwardedBody, with the request's
  *  original (pre-rebuild) message list. Cost is one canonical stringify per
@@ -640,7 +653,21 @@ export function credentialFingerprint(headers: Record<string, string> | undefine
             // Strip the auth-scheme envelope so "Bearer X" (authorization) and
             // a bare "X" (x-api-key) hash to the SAME credential identity.
             const v = value.trim().replace(/^Bearer\s+/i, "").trim();
-            if (v !== "") { cred = v; break; }
+            if (v !== "") {
+                // #1884 resign lane: SDK-HMAC-SHA256 authorization lines are
+                // re-signed EVERY request (Signature is an HMAC over the
+                // per-request date + body hash), so hashing the raw line
+                // yields a per-request-unique identity — downstream that
+                // meant the 429 governor's holds never matched (#4204 never
+                // throttled on the APIG lane it was built for), the #3376
+                // keepalive snapshot deleted itself after every forward, and
+                // #2131 cache-sample attribution fragmented into one bucket
+                // per request. The STABLE credential on that line is the
+                // Access key id — fingerprint only that.
+                const m = /^SDK-HMAC-SHA256\s+Access=([^\s,]+)/i.exec(v);
+                cred = m !== null ? `sdk-hmac:${m[1]!}` : v;
+                break;
+            }
         }
     }
     if (cred === undefined) return undefined;
@@ -1291,10 +1318,14 @@ export function recordCacheSample(
     if (pending.length > 0 && known && s.input > 0) {
         const rawMissed = s.input - effCached;
         if (rawMissed > 8192 && rawMissed > 0.3 * s.input) {
-            const curB = session.transient?.sentBody;
+            // #4731: both pending sides come from ONE source via
+            // pendingEvidencePair — on the relay lane the evidence lives in
+            // the #4430 ALS capture (session.transient.sentBody is never
+            // written there), on the loop lane it falls back to the transient
+            // slot byte-identically.
+            const { sentBody: curB, inBody: curIn } = pendingEvidencePair(session);
             const prevB = session.transient?.settledBody;
             if (curB !== undefined && prevB !== undefined && curB.bytes <= SEAM_BODY_CAP && prevB.bytes <= SEAM_BODY_CAP) {
-                const curIn = session.transient?.inBody;
                 const prevIn = session.transient?.settledInBody;
                 const clientBreak = curIn !== undefined && prevIn !== undefined && curIn.msgs <= INBOUND_MSG_CAP && prevIn.msgs <= INBOUND_MSG_CAP && (() => {
                     const k = firstDivergentInboundMsg(prevIn, curIn);
@@ -1923,6 +1954,12 @@ export function settleUsageReport(
     else delete settled.settledBody;
     delete pending.sentBody;
     const seamIn = pending.inBody;
+    // #4731: noteForwardedBody deletes pending.inBody on round>1 of a capture,
+    // so a same-request retry settles without inbound evidence and drops the
+    // settledInBody baseline (the round-2 delete-then-miss). That conservative
+    // behavior stays BY DESIGN: #3023 attribution is diagnostic-only (nothing
+    // bills on settledInBody), and the pair accessor cannot cheaply recover
+    // the evidence here because the delete removes it from the capture itself.
     if (seamBody !== undefined && seamIn !== undefined && !backwards) settled.settledInBody = seamIn;
     else delete settled.settledInBody;
     delete pending.inBody;

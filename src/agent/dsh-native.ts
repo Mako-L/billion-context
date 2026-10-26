@@ -58,10 +58,11 @@ import { isVersionNewer } from "../update.js";
 import { VERSION } from "../version.js";
 import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
 import { adminRelayEnabled, resolveResignSettings } from "../config.js";
-import { dshContextTabEnabled, dshContextTabLabel } from "../knobs.js";
+import { decodeRequestBody } from "../content-encoding.js";
+import { dshContextTabEnabled, dshContextTabLabel, limitsDecodedBytes } from "../knobs.js";
 import { MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
-import { installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
+import { bodyProvablyOverWindow as sharedBodyProvablyOverWindow, installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
@@ -593,33 +594,24 @@ function effectiveContextWindow(ctx: PluginContext): number | undefined {
     return modelInfo.byKey.get(modelInfoKey(target.provider, target.model))?.contextWindow;
 }
 
-/** #4111: the shared two-stage doom predicate for the gate's oversize arms
- *  (the `threw` arm and the unattributed arm). Stage 1 prices the RAW body at
- *  bytes/4 — exactly the old math, cheap — and disarms when that is not even
- *  provisionally over the #4079-floored window. Stage 2 runs ONLY on the
- *  would-refuse path: re-price on media-excluded core bytes and disarm when
- *  the core text alone still fits (the #4111 false refusal was media mass
- *  billed as text). Returns the refusal's numbers when the body is PROVABLY
- *  over (core text alone cannot fit), undefined otherwise. No body, unreadable
- *  body, or unresolvable window → undefined — the arms keep #1117 direct
- *  semantics and can never false-refuse from missing data. */
+// Gate face of the shared doom math (#4111/#4516): keeps the gate's
+// init-body signature for its call sites and tests, decoding init.body into
+// the raw string the shared form (native-intercept.ts) prices with the
+// media-aware walk (media-bytes.ts).
+function rawBodyStringOf(init: RequestInit | undefined): string | undefined {
+    const body: unknown = init?.body;
+    if (typeof body === "string") return body;
+    if (body instanceof Uint8Array) return new TextDecoder().decode(body);
+    if (body instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(body));
+    return undefined;
+}
+
 export function bodyProvablyOverWindow(
     body: { bytes: number } | undefined,
     init: RequestInit | undefined,
     declaredWindow: number | undefined,
-): { coreBytes: number; mediaBytes: number; floorTokens: number; window: number; declaredWindow: number } | undefined {
-    if (body === undefined || declaredWindow === undefined) return undefined;
-    const window = Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
-    if (Math.ceil(body.bytes / 4) <= window) return undefined;
-    const rawBody: unknown = init?.body;
-    let raw: string | undefined;
-    if (typeof rawBody === "string") raw = rawBody;
-    else if (rawBody instanceof Uint8Array) raw = new TextDecoder().decode(rawBody);
-    else if (rawBody instanceof ArrayBuffer) raw = new TextDecoder().decode(new Uint8Array(rawBody));
-    const mediaBytes = raw === undefined ? 0 : mediaBytesOfWireBody(raw);
-    const coreBytes = Math.max(body.bytes - mediaBytes, 0);
-    if (Math.ceil(coreBytes / 4) <= window) return undefined;
-    return { coreBytes, mediaBytes, floorTokens: Math.ceil(coreBytes / 4), window, declaredWindow };
+): ReturnType<typeof sharedBodyProvablyOverWindow> {
+    return sharedBodyProvablyOverWindow(body?.bytes, rawBodyStringOf(init), declaredWindow);
 }
 
 function refreshModelInfo(origin: string | undefined, target?: { provider: string; model: string }): void {
@@ -1345,25 +1337,70 @@ function noteForkVerdict(verdict: Extract<ForkChildVerdict, { ok: false }>): voi
     }
 }
 
-function bodyJsonOf(init: RequestInit | undefined): unknown {
-    const raw = init?.body;
-    if (typeof raw === "string") {
-        try {
-            return JSON.parse(raw);
-        } catch {
-            return undefined;
+// #4829: the content-encoding header across every shape fetch accepts
+// (Headers instance, [name, value] pairs, name → value record). Case-
+// insensitive; malformed shapes yield undefined = "no encoding declared".
+function contentEncodingOf(init: RequestInit | undefined): string | undefined {
+    const headers = init?.headers;
+    if (headers === undefined || headers === null) return undefined;
+    try {
+        if (typeof (headers as Headers).get === "function") {
+            const v = (headers as Headers).get("content-encoding");
+            return v === null ? undefined : v;
         }
+    } catch {
+        return undefined;
     }
-    if (raw instanceof Uint8Array || raw instanceof ArrayBuffer) {
-        try {
-            return JSON.parse(new TextDecoder().decode(raw));
-        } catch {
-            return undefined;
+    if (Array.isArray(headers)) {
+        for (const pair of headers) {
+            if (Array.isArray(pair) && pair.length >= 2 && String(pair[0]).toLowerCase() === "content-encoding" && typeof pair[1] === "string") return pair[1];
+        }
+        return undefined;
+    }
+    if (typeof headers === "object") {
+        for (const [k, v] of Object.entries(headers)) {
+            if (k.toLowerCase() !== "content-encoding") continue;
+            if (typeof v === "string") return v;
+            if (Array.isArray(v)) return v.join(", ");
         }
     }
     return undefined;
 }
 
+// #4829: hosts may ship the request body content-encoded — the Codex SSE
+// transport (pi-ai) sends zstd-compressed Uint8Array bodies with a
+// content-encoding header. Decode for INSPECTION ONLY (fork-adoption
+// projection, #4082 recall fingerprints); the outgoing bytes are never
+// touched. Decoding reuses the server-side codec table (#619) so lane and
+// proxy agree on which codings are understood; every failure mode
+// (undecodable bytes, unsupported coding, decompression-bomb cap) yields
+// undefined = today's unparseable behavior. A JS string cannot be compressed,
+// so it parses as-is even under an encoding header.
+async function bodyJsonOf(init: RequestInit | undefined): Promise<unknown> {
+    const raw = init?.body;
+    let text: string | undefined;
+    if (typeof raw === "string") {
+        text = raw;
+    } else if (raw instanceof Uint8Array || raw instanceof ArrayBuffer) {
+        const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+        const encoding = contentEncodingOf(init);
+        if (encoding === undefined) {
+            text = new TextDecoder().decode(bytes);
+        } else {
+            try {
+                text = (await decodeRequestBody(encoding, Buffer.from(bytes), limitsDecodedBytes())).body.toString("utf8");
+            } catch {
+                return undefined;
+            }
+        }
+    }
+    if (text === undefined) return undefined;
+    try {
+        return JSON.parse(text);
+    } catch {
+        return undefined;
+    }
+}
 
 async function maybeForkAdoptBeforeSend(ctx: PluginContext, init: RequestInit | undefined): Promise<void> {
     const child = forkChildVerdict(ctx);
@@ -1376,10 +1413,10 @@ async function maybeForkAdoptBeforeSend(ctx: PluginContext, init: RequestInit | 
             `bili-native-dsh: fork adoption for ${child.sid} skipped at the tools-ready gate — this request arrived before bili tool registration completed; later requests can still adopt (#4215)`);
         return;
     }
-    const body = bodyJsonOf(init);
+    const body = await bodyJsonOf(init);
     if (body === undefined) {
         noteForkGateOnce(`gate:body-parse:${child.sid}`, "warn",
-            `bili-native-dsh: fork adoption for ${child.sid} skipped at the body-parse gate — the request body was not parseable JSON, so the replay cannot be projected (#4215)`);
+            `bili-native-dsh: fork adoption for ${child.sid} skipped at the body-parse gate — the request body was not parseable JSON after content-encoding decode, so the replay cannot be projected (#4215/#4829)`);
         return;
     }
     if (sideShapedBody(body)) {
@@ -1616,14 +1653,14 @@ const pendingNegotiatedStamps = new WeakMap<object, string>();
  * contains a remembered boundary for this lane — provably a known session's
  * continuation — claim the request for the plugin lane; beforeSend stamps the
  * negotiated sid. No evidence or ambiguity ⇒ undefined ⇒ today's refusal. */
-function maybeNegotiatedClaim(url: string, init: RequestInit | undefined): string | undefined {
+async function maybeNegotiatedClaim(url: string, init: RequestInit | undefined): Promise<string | undefined> {
     if (init === undefined) return undefined;
     const laneKey = recallLaneKey(url);
     // #4082 review: probe before parsing — agentless sidecars (title-gen etc.)
     // hit this path constantly, and multi-MB quota-retry bodies must not pay
     // full JSON.parse + per-message hashing when no session was ever learned.
     if (!recallLaneHasEntries(laneKey)) return undefined;
-    const body = bodyJsonOf(init);
+    const body = await bodyJsonOf(init);
     if (body === undefined || typeof body !== "object") return undefined;
     const messages = (body as { messages?: unknown }).messages;
     if (!Array.isArray(messages) || messages.length === 0) return undefined;
@@ -1662,7 +1699,7 @@ async function maybeRecallBeforeSend(ctx: PluginContext, url: string, init: Requ
     if (!register.toolsReady || init === undefined) return;
     const attr = attributionOf(ctx);
     if (attr.state === "ok") {
-        const body = bodyJsonOf(init);
+        const body = await bodyJsonOf(init);
         if (body === undefined || typeof body !== "object") return;
         const messages = (body as { messages?: unknown }).messages;
         if (!Array.isArray(messages) || messages.length === 0) return;
@@ -2116,12 +2153,30 @@ export function apply(ctx: PluginContext): void {
         // recall — the body itself may prove it is a known session's
         // continuation (retry / model switch shape). A claim here routes the
         // request onto the plugin lane with the negotiated sid; refusal below
-        // stays byte-identical when there is no evidence.
-        if (attr.state === "none" && maybeNegotiatedClaim(url, init) !== undefined) {
-            // Deliberately NOT noteAttrRecovery(): the host attribution is
-            // still broken — the health signal stays honest; the REQUEST is
-            // what got rescued, not the initiator scope (#4082).
-            return true;
+        // stays byte-identical when there is no evidence. #4829: the claim may
+        // now decode content-encoded bodies, so this arm settles async — the
+        // gate contract already tolerates Promise verdicts (threw arm).
+        if (attr.state === "none") {
+            // #4829 review: without init there is no body to decode and the
+            // claim can never succeed — settle synchronously so this shape
+            // keeps the OLD verdict class: native-ws-intercept.ts compares
+            // its gate result with === false WITHOUT awaiting.
+            if (init === undefined) {
+                threwStreak = 0;
+                threwGiveUpNoticed = false;
+                return refuseUnattributed(url, attr, body, init);
+            }
+            return maybeNegotiatedClaim(url, init).then((claimed) => {
+                if (claimed !== undefined) {
+                    // Deliberately NOT noteAttrRecovery(): the host attribution
+                    // is still broken — the health signal stays honest; the
+                    // REQUEST is what got rescued, not the initiator scope (#4082).
+                    return true;
+                }
+                threwStreak = 0;
+                threwGiveUpNoticed = false;
+                return refuseUnattributed(url, attr, body, init);
+            });
         }
         if (attr.state === "threw") {
             return settleThrewAttribution(attr.message, url, body, init).then((verdict) => {
