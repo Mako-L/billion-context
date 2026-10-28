@@ -7,6 +7,8 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ### Fixed
 - 块区间边界在重存时不再回退:折叠后客户端重发的视图不含已覆盖原文,重入库时该批次无法重新解析区间(-1/-1),旧逻辑会把已解析的真实区间抹掉。现在区间证据一旦解析即持久(入库 `CASE` 保留;sqlite/mysql 双后端),未知块保持诚实缺口(#4608)。
+- 优雅停机(SIGTERM → dispose)的 writer 标记现在记录 `stoppedAt`:重启流程(杀旧进程→立即重绑)不再对已确认死亡的前任实例误报 [split-brain]——30s 新鲜度回退从此只覆盖无法证明死亡的崩溃场景(#3923;release-gate lane A 代理重启时观察到误报)。
+- Claude Code 子代理的 bili 调用不再路由到父会话:Task 子代理与父线程共用一个 MCP shim,启动时抓的绑定只指向父会话;子代理压缩错对象或永久 409。现在 shim 把 host 盖在每次 tools/call 上的 `_meta["claudecode/toolUseId"]` 转发为 body `toolCallId`,代理用它出站时记下的 id→会话映射直接路由到子代理自己的 lane(10 分钟 TTL);id 未知时行为与从前完全一致(#4580)。
 
 ### Added
 
